@@ -2161,158 +2161,140 @@ function initYouTubePlayer() {
   const m   = S.activeModule;
   const cid = S.activeCourse?.id;
   if (!m || !m.ytId) return;
+  // file:// guard already handled in renderCoursePlayer — no iframe rendered there
+  if (location.protocol === 'file:') return;
 
   const isAlreadyWatched = (DB.prog(S.session.id)[cid]?.watched || []).includes(m.id);
   const ytVidId = m.ytId;
 
-  // ── Plain iframe embed with postMessage enforcement ────────────────────────
-  // We intentionally avoid the IFrame JS API (new YT.Player) because it
-  // triggers Error 153 on file:// origins and on any video whose owner has
-  // restricted the API (even if normal embed is allowed). A plain <iframe>
-  // with enablejsapi=1 + postMessage works on all origins.
-  const iframe = document.createElement('iframe');
-  iframe.id    = 'yt-iframe';
-  iframe.setAttribute('width',  '100%');
-  iframe.setAttribute('height', '100%');
-  iframe.style.cssText  = 'border:0;display:block';
-  iframe.allow          = 'autoplay; encrypted-media; fullscreen';
-  iframe.allowFullscreen = true;
+  // ── Load the IFrame JS API once, then create the player ───────────────────
+  // On HTTP(S) the JS API works correctly and gives us reliable getCurrentTime,
+  // getDuration, seekTo and onStateChange — far more reliable than postMessage.
+  function createPlayer() {
+    if (!document.getElementById('yt-player')) return; // guard re-render race
 
-  // Only include origin= on real HTTP(S) pages; on file:// it must be omitted.
-  const isHttp = /^https?:/.test(location.protocol);
-  const originParam = isHttp ? `&origin=${encodeURIComponent(location.origin)}` : '';
-  iframe.src = `https://www.youtube.com/embed/${encodeURIComponent(ytVidId)}?enablejsapi=1&rel=0&modestbranding=1&iv_load_policy=3${originParam}`;
+    let lastTime  = 0;
+    let completed = false;
+    let tickTimer = null;
 
-  // Swap the placeholder div for the real iframe
-  const placeholder = document.getElementById('yt-player');
-  if (placeholder) placeholder.replaceWith(iframe); else wrap.appendChild(iframe);
-
-  // Already-watched: no enforcement needed
-  if (isAlreadyWatched) { /* postMessage handler will skip enforcement */ }
-
-  // ── postMessage enforcement ────────────────────────────────────────────────
-  // YouTube broadcasts JSON over window.message:
-  //   {event:"onStateChange", info: <playerState>}
-  //   {event:"infoDelivery",  info: {currentTime, duration, ...}}
-  //   {event:"onError",       info: <errorCode>}
-  // We poll currentTime by sending a getVideoData command each tick.
-
-  let lastTime  = 0;
-  let completed = false;
-  let duration  = 0;
-  let tickTimer = null;
-
-  function ytCmd(func, args) {
-    try {
-      iframe.contentWindow.postMessage(
-        JSON.stringify({ event: 'command', func, args: args || [] }), '*'
-      );
-    } catch(_) {}
-  }
-
-  function startPolling() {
-    clearInterval(tickTimer);
-    tickTimer = setInterval(() => {
-      if (!document.getElementById('yt-iframe')) { clearInterval(tickTimer); return; }
-      ytCmd('getVideoData');
-    }, 500);
-  }
-
-  function stopPolling() { clearInterval(tickTimer); }
-
-  function showEmbedError(code) {
-    stopPolling();
-    window.removeEventListener('message', onMsg);
-    const isEmbedBlocked = [101, 150, 153].includes(code);
-    wrap.innerHTML = `
-      <div style="width:100%;min-height:200px;display:flex;align-items:center;justify-content:center;
-                  background:#0f0f0f;border-radius:6px;padding:24px;box-sizing:border-box">
-        <div style="text-align:center;max-width:340px">
-          <div style="font-size:40px;margin-bottom:12px">${isEmbedBlocked ? '🚫' : '⚠️'}</div>
-          <p style="color:#fff;font-weight:700;font-size:15px;margin-bottom:8px">
-            ${isEmbedBlocked ? 'Embedding disabled for this video' : 'Video unavailable'}
-          </p>
-          <p style="color:rgba(255,255,255,0.55);font-size:12px;margin-bottom:18px;line-height:1.5">
-            ${isEmbedBlocked
-              ? 'The video owner has disabled embedding. Ask your admin to replace this with a video that allows embedding, or upload a video file instead.'
-              : `YouTube error ${code} — the video may be private, deleted, or region-restricted.`}
-          </p>
-          <a href="https://www.youtube.com/watch?v=${encodeURIComponent(ytVidId)}"
-             target="_blank" rel="noopener noreferrer"
-             style="display:inline-block;padding:9px 20px;background:#FF0000;color:#fff;
-                    border-radius:6px;font-size:13px;font-weight:600;text-decoration:none">
-            Watch on YouTube ↗
-          </a>
-        </div>
-      </div>`;
-    const bar = document.getElementById('yt-vpf');
-    if (bar) bar.style.display = 'none';
-  }
-
-  function onMsg(e) {
-    if (!String(e.origin).includes('youtube.com')) return;
-    let data;
-    try { data = typeof e.data === 'string' ? JSON.parse(e.data) : e.data; } catch { return; }
-
-    if (data.event === 'onError') {
-      showEmbedError(Number(data.info));
-      return;
+    function showEmbedError(code) {
+      clearInterval(tickTimer);
+      const isEmbedBlocked = [101, 150, 153].includes(code);
+      wrap.innerHTML = `
+        <div style="width:100%;min-height:200px;display:flex;align-items:center;justify-content:center;
+                    background:#0f0f0f;border-radius:6px;padding:24px;box-sizing:border-box">
+          <div style="text-align:center;max-width:340px">
+            <div style="font-size:40px;margin-bottom:12px">${isEmbedBlocked ? '🚫' : '⚠️'}</div>
+            <p style="color:#fff;font-weight:700;font-size:15px;margin-bottom:8px">
+              ${isEmbedBlocked ? 'Embedding disabled for this video' : 'Video unavailable'}
+            </p>
+            <p style="color:rgba(255,255,255,0.55);font-size:12px;margin-bottom:18px;line-height:1.5">
+              ${isEmbedBlocked
+                ? 'The video owner has disabled embedding. Ask your admin to replace this with a video that allows embedding, or upload a video file instead.'
+                : `YouTube error ${code} — the video may be private, deleted, or region-restricted.`}
+            </p>
+            <a href="https://www.youtube.com/watch?v=${encodeURIComponent(ytVidId)}"
+               target="_blank" rel="noopener noreferrer"
+               style="display:inline-block;padding:9px 20px;background:#FF0000;color:#fff;
+                      border-radius:6px;font-size:13px;font-weight:600;text-decoration:none">
+              Watch on YouTube ↗
+            </a>
+          </div>
+        </div>`;
+      const bar = document.getElementById('yt-vpf');
+      if (bar) bar.style.display = 'none';
     }
 
-    if (data.event === 'onStateChange') {
-      const state = Number(data.info);
-      if (state === 1) {       // playing
-        startPolling();
-      } else if (state === 0) { // ended
-        stopPolling();
-        if (!isAlreadyWatched && !completed) {
-          completed = true;
-          window.removeEventListener('message', onMsg);
-          markVideoComplete(m.id, cid);
-        }
-      } else {
-        stopPolling();
-      }
-      return;
-    }
+    new YT.Player('yt-player', {
+      videoId: ytVidId,
+      width:  '100%',
+      height: '100%',
+      playerVars: {
+        rel:            0,
+        modestbranding: 1,
+        iv_load_policy: 3,
+        controls:       1,
+        origin:         location.origin,
+      },
+      events: {
+        onReady(e) {
+          // nothing to do on ready
+        },
+        onError(e) {
+          clearInterval(tickTimer);
+          showEmbedError(e.data);
+        },
+        onStateChange(e) {
+          if (e.data === YT.PlayerState.PLAYING) {
+            clearInterval(tickTimer);
+            tickTimer = setInterval(() => {
+              // Guard: player may have been destroyed by a re-render
+              if (!document.getElementById('yt-player') &&
+                  !document.querySelector('iframe#yt-iframe')) {
+                clearInterval(tickTimer); return;
+              }
+              let cur, dur;
+              try {
+                cur = e.target.getCurrentTime();
+                dur = e.target.getDuration();
+              } catch(_) { clearInterval(tickTimer); return; }
 
-    if (data.event === 'infoDelivery' && data.info) {
-      const info = data.info;
-      if (info.duration > 0)      duration = info.duration;
-      if (info.currentTime != null) {
-        const cur = Number(info.currentTime);
-        const dur = duration;
+              // Update progress bar
+              const bar = document.getElementById('yt-vpf');
+              if (bar && dur > 0) bar.style.width = (cur / dur * 100) + '%';
 
-        const bar = document.getElementById('yt-vpf');
-        if (bar && dur > 0) bar.style.width = (cur / dur * 100) + '%';
+              if (isAlreadyWatched || completed || !(dur > 0)) return;
 
-        if (!isAlreadyWatched && !completed && dur > 0) {
-          if (cur > lastTime + 4) {
-            ytCmd('seekTo', [lastTime, true]);
-            toast('Please watch the video without skipping ⛔', 'err');
-            return;
+              // Snap back on forward seek (> 4 s tolerance)
+              if (cur > lastTime + 4) {
+                try { e.target.seekTo(lastTime, true); } catch(_) {}
+                toast('Please watch the video without skipping ⛔', 'err');
+                return;
+              }
+              lastTime = Math.max(lastTime, cur);
+
+              if (cur >= dur - 2) {
+                completed = true;
+                clearInterval(tickTimer);
+                markVideoComplete(m.id, cid);
+              }
+            }, 500);
+
+          } else {
+            clearInterval(tickTimer);
           }
-          lastTime = Math.max(lastTime, cur);
-          if (cur >= dur - 2) {
+
+          // Ended state — backup completion trigger
+          if (e.data === YT.PlayerState.ENDED && !completed && !isAlreadyWatched) {
             completed = true;
-            stopPolling();
-            window.removeEventListener('message', onMsg);
+            clearInterval(tickTimer);
             markVideoComplete(m.id, cid);
           }
-        }
-      }
-    }
+        },
+      },
+    });
   }
 
-  window.addEventListener('message', onMsg);
-
-  // After iframe loads, subscribe to state-change and error events
-  iframe.addEventListener('load', () => {
-    setTimeout(() => {
-      ytCmd('addEventListener', ['onStateChange']);
-      ytCmd('addEventListener', ['onError']);
-    }, 400);
-  });
+  // Load YT script once, queue createPlayer until API is ready
+  if (window.YT && window.YT.Player) {
+    createPlayer();
+  } else if (!window._ytLoading) {
+    window._ytLoading = true;
+    window._ytQueue = window._ytQueue || [];
+    window._ytQueue.push(createPlayer);
+    window.onYouTubeIframeAPIReady = function() {
+      (window._ytQueue || []).splice(0).forEach(fn => fn());
+    };
+    const tag = document.createElement('script');
+    tag.src = 'https://www.youtube.com/iframe_api';
+    document.head.appendChild(tag);
+  } else {
+    // Script already loading — queue our callback
+    window._ytQueue = window._ytQueue || [];
+    window._ytQueue.push(createPlayer);
+    // Ensure the ready handler will flush the queue (in case it fired already)
+    if (window.YT && window.YT.Player) createPlayer();
+  }
 }
 
 function markVideoComplete(mid, cid) {
