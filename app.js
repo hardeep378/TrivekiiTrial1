@@ -663,7 +663,6 @@ function renderCoursePlayer() {
       mediaBlock += `<div class="video-wrapper" style="position:relative;background:#000">
         <div id="yt-player-wrap" style="width:100%;height:100%;position:relative">
           <div id="yt-player"></div>
-          <div id="yt-shield" style="position:absolute;inset:0;z-index:1;cursor:default" title="Controls disabled — please watch the full video"></div>
         </div>
         <div class="video-progress-bar"><div class="video-progress-fill" id="yt-vpf" style="width:0%"></div></div>
       </div>
@@ -2188,11 +2187,8 @@ function initYouTubePlayer() {
   const placeholder = document.getElementById('yt-player');
   if (placeholder) placeholder.replaceWith(iframe); else wrap.appendChild(iframe);
 
-  // Already-watched: drop the no-skip shield
-  if (isAlreadyWatched) {
-    const shield = document.getElementById('yt-shield');
-    if (shield) shield.remove();
-  }
+  // Already-watched: no enforcement needed
+  if (isAlreadyWatched) { /* postMessage handler will skip enforcement */ }
 
   // ── postMessage enforcement ────────────────────────────────────────────────
   // YouTube broadcasts JSON over window.message:
