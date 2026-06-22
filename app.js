@@ -10,14 +10,14 @@ const DEFAULT_COURSES = [
   { id:'c1', title:'Sample Course', cat:'General', catClass:'badge-blue',
     modules:[
       {id:'m1',title:'Module 1 — Introduction',dur:'10 min',description:'A sample module. Replace with your own content.',
-        video:false, pdf:false, url:'https://www.example.com',
+        video:false, pdf:false, ytId:'',
         quiz:[
           {q:'This is a sample module quiz question. What is 2 + 2?',opts:['3','4','5','6'],ans:1},
           {q:'Sample question two — which is a colour?',opts:['Square','Blue','Loud','Fast'],ans:1},
         ]
       },
       {id:'m2',title:'Module 2 — Going Deeper',dur:'12 min',description:'A second sample module.',
-        video:false, pdf:false, url:'https://www.example.com',
+        video:false, pdf:false, ytId:'',
         quiz:[
           {q:'Sample module-2 question. Which number is largest?',opts:['1','10','5','3'],ans:1},
         ]
@@ -119,7 +119,8 @@ let S = {
   videoWatched: {},
   _videoUrl: null,  // preloaded video blob (data URI) for active module
   _pdfUrl: null,    // preloaded PDF blob (data URI) for active module
-  _contentTab: null, // which content the learner is viewing: 'video'|'pdf'|'url'
+  _ytId: null,      // YouTube video ID for active module
+  _contentTab: null, // which content the learner is viewing: 'video'|'pdf'|'youtube'
 };
 
 // ═══════════════════════════════════════════════════
@@ -184,6 +185,21 @@ function statusBadge(pct) {
 }
 function esc(str) {
   return String(str||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// Extract YouTube video ID from various URL formats (or bare ID)
+function parseYtId(raw) {
+  if (!raw) return '';
+  raw = raw.trim();
+  // youtu.be/ID
+  let m = raw.match(/youtu\.be\/([A-Za-z0-9_-]{11})/);
+  if (m) return m[1];
+  // youtube.com/watch?v=ID or /embed/ID or /v/ID
+  m = raw.match(/(?:youtube\.com\/(?:watch\?v=|embed\/|v\/|shorts\/))([A-Za-z0-9_-]{11})/);
+  if (m) return m[1];
+  // bare 11-char video ID
+  if (/^[A-Za-z0-9_-]{11}$/.test(raw)) return raw;
+  return '';
 }
 function toast(msg, type='ok') {
   const tc = document.getElementById('toast-container');
@@ -360,7 +376,7 @@ function launch(session) {
 
 document.getElementById('logout-btn').addEventListener('click',()=>{
   DB.clearSession();
-  S = {session:null,tab:'dashboard',activeCourse:null,activeModule:null,quiz:null,selectedUser:null,authMode:'login',adminSubTab:'info',videoWatched:{},_videoUrl:null,_pdfUrl:null,_contentTab:null};
+  S = {session:null,tab:'dashboard',activeCourse:null,activeModule:null,quiz:null,selectedUser:null,authMode:'login',adminSubTab:'info',videoWatched:{},_videoUrl:null,_pdfUrl:null,_ytId:null,_contentTab:null};
   appScreen.style.display  = 'none';
   authScreen.style.display = 'grid';
   document.getElementById('topnav').classList.remove('admin-nav');
@@ -415,16 +431,17 @@ function render() {
 
 // Call this before render() whenever the active module changes
 async function loadAndRender(preferredTab) {
-  S._videoUrl = null; S._pdfUrl = null; S._contentTab = null;
+  S._videoUrl = null; S._pdfUrl = null; S._ytId = null; S._contentTab = null;
   if (S.activeCourse && S.activeModule && S.activeModule.id) {
     const m = S.activeModule;
     try { if (m.video) S._videoUrl = await IDB.get(m.id+'_video'); } catch(e){}
     try { if (m.pdf)   S._pdfUrl   = await IDB.get(m.id+'_pdf');   } catch(e){}
-    // Pick which content to show first: explicit preference, else video > pdf > url
+    if (m.ytId) S._ytId = m.ytId;
+    // Pick which content to show first: explicit preference, else video > youtube > pdf
     const avail = [];
     if (S._videoUrl) avail.push('video');
+    if (S._ytId)     avail.push('youtube');
     if (S._pdfUrl)   avail.push('pdf');
-    if (m.url)       avail.push('url');
     S._contentTab = (preferredTab && avail.includes(preferredTab)) ? preferredTab : (avail[0]||null);
   }
   render();
@@ -577,11 +594,11 @@ function renderCoursePlayer() {
   // Determine which content sources exist for this module
   const hasVideo = !!S._videoUrl;
   const hasPdf   = !!S._pdfUrl;
-  const hasUrl   = !!m.url;
+  const hasYt    = !!S._ytId;
   const sources = [];
-  if (hasVideo) sources.push({key:'video', label:'🎬 Video'});
-  if (hasPdf)   sources.push({key:'pdf',   label:'📄 PDF'});
-  if (hasUrl)   sources.push({key:'url',   label:'🔗 Link'});
+  if (hasVideo) sources.push({key:'video',   label:'🎬 Video'});
+  if (hasYt)    sources.push({key:'youtube', label:'▶ YouTube'});
+  if (hasPdf)   sources.push({key:'pdf',     label:'📄 PDF'});
   // active tab (fall back to first available)
   let activeTab = S._contentTab;
   if (!activeTab || !sources.find(s=>s.key===activeTab)) activeTab = sources[0]?.key || null;
@@ -617,17 +634,44 @@ function renderCoursePlayer() {
     <div style="display:flex;gap:10px;align-items:center;margin-bottom:12px">
       <span style="font-size:12px;color:var(--muted)">📄 PDF — scroll through it, then mark the module complete below.</span>
     </div>`;
-  } else if (activeTab==='url') {
-    mediaBlock += `<div class="pdf-wrapper" style="background:#0E1525;min-height:300px;display:flex;align-items:center;justify-content:center">
-      <div style="text-align:center;padding:30px">
-        <div style="font-size:42px;margin-bottom:12px">🔗</div>
-        <p style="color:#F5F3EE;font-size:14px;margin-bottom:6px">External resource</p>
-        <p style="color:rgba(245,243,238,0.45);font-size:12px;margin-bottom:18px;word-break:break-all">${esc(m.url)}</p>
-        <a href="${esc(m.url)}" target="_blank" rel="noopener noreferrer" class="btn-primary" style="display:inline-block;text-decoration:none;width:auto;padding:11px 26px">Open link in new tab ↗</a>
+  } else if (activeTab==='youtube') {
+    const isFileProtocol = location.protocol === 'file:';
+    if (isFileProtocol) {
+      // YouTube blocks ALL embedding from file:// — show a clear explanation
+      // instead of letting YouTube render its own broken Error 153 screen.
+      mediaBlock += `<div class="video-wrapper" style="background:#0f0f0f;display:flex;align-items:center;justify-content:center">
+        <div style="text-align:center;padding:32px;max-width:380px">
+          <div style="font-size:44px;margin-bottom:14px">🌐</div>
+          <p style="color:#fff;font-weight:700;font-size:15px;margin-bottom:10px">YouTube requires a web server</p>
+          <p style="color:rgba(255,255,255,0.55);font-size:12px;line-height:1.6;margin-bottom:20px">
+            You're opening this app directly as a file (<code style="background:rgba(255,255,255,0.1);padding:1px 5px;border-radius:3px">file://</code>).
+            YouTube blocks all embedded video playback on file:// pages — this is a YouTube restriction, not a bug.<br><br>
+            <strong style="color:rgba(255,255,255,0.8)">Fix:</strong> serve the app over HTTP, for example:<br>
+            <code style="display:inline-block;margin-top:8px;background:rgba(255,255,255,0.1);padding:4px 10px;border-radius:4px;font-size:11px">npx serve .</code>
+            &nbsp;or&nbsp;
+            <code style="background:rgba(255,255,255,0.1);padding:4px 10px;border-radius:4px;font-size:11px">python -m http.server</code>
+          </p>
+          <a href="https://www.youtube.com/watch?v=${esc(S._ytId)}"
+             target="_blank" rel="noopener noreferrer"
+             style="display:inline-block;padding:9px 20px;background:#FF0000;color:#fff;
+                    border-radius:6px;font-size:13px;font-weight:600;text-decoration:none">
+            Watch on YouTube instead ↗
+          </a>
+        </div>
+      </div>`;
+    } else {
+      mediaBlock += `<div class="video-wrapper" style="position:relative;background:#000">
+        <div id="yt-player-wrap" style="width:100%;height:100%;position:relative">
+          <div id="yt-player"></div>
+          <div id="yt-shield" style="position:absolute;inset:0;z-index:1;cursor:default" title="Controls disabled — please watch the full video"></div>
+        </div>
+        <div class="video-progress-bar"><div class="video-progress-fill" id="yt-vpf" style="width:0%"></div></div>
       </div>
-    </div>`;
+      <div style="display:flex;gap:10px;align-items:center;margin-bottom:12px">
+        <span style="font-size:12px;color:var(--muted)">▶ Watch the full YouTube video to continue — skipping is not allowed.</span>
+      </div>`;
+    }
   }
-
   return `<div class="fade">
     <div style="display:flex;align-items:center;gap:12px;margin-bottom:22px">
       <button class="btn-ghost btn-sm" id="back-btn">← Back</button>
@@ -654,9 +698,9 @@ function renderCoursePlayer() {
             const moduleComplete = isModuleComplete(uid, c.id, m.id);
             // Step 1: watch/read the content
             if (!isWatched) {
-              // If a video exists, require full watch (enforced by player). Otherwise allow manual mark.
-              if (hasVideo && activeTab==='video') {
-                return `<div id="video-status-msg" style="font-size:12px;color:var(--muted)">⏳ Watch the full video to continue${(hasPdf||hasUrl)?' (or switch tabs and mark complete after reviewing the other material)':''}</div>`;
+              // If a video or YouTube exists, require full watch (enforced by player). Otherwise allow manual mark.
+              if ((hasVideo && activeTab==='video') || (hasYt && activeTab==='youtube')) {
+                return `<div id="video-status-msg" style="font-size:12px;color:var(--muted)">⏳ Watch the full video to continue${hasPdf?' (or switch tabs and mark complete after reviewing the PDF)':''}</div>`;
               }
               return `<button class="btn-primary btn-sm" id="mark-btn" data-cid="${c.id}" data-mid="${m.id}" style="width:auto">Mark as complete</button>`;
             }
@@ -704,7 +748,7 @@ function renderCoursePlayer() {
             <div class="mod-num" style="background:${numBg};color:${numColor}">${complete?'✓':unlocked?i+1:'🔒'}</div>
             <div>
               <p style="font-size:13px;font-weight:500">${esc(mod.title)}</p>
-              <p style="font-size:11px;color:var(--muted)">${mod.dur}${[mod.video?'🎬':'',mod.pdf?'📄':'',mod.url?'🔗':''].filter(Boolean).length?' · '+[mod.video?'🎬':'',mod.pdf?'📄':'',mod.url?'🔗':''].filter(Boolean).join(' '):''}${modHasQuiz?' · 📝':''}</p>
+              <p style="font-size:11px;color:var(--muted)">${mod.dur}${[mod.video?'🎬':'',mod.ytId?'▶':'',mod.pdf?'📄':''].filter(Boolean).length?' · '+[mod.video?'🎬':'',mod.ytId?'▶':'',mod.pdf?'📄':''].filter(Boolean).join(' '):''}${modHasQuiz?' · 📝':''}</p>
             </div>
           </div>`;
         }).join('')}
@@ -1351,7 +1395,7 @@ function moduleRow(m, i) {
     <div class="field"><label>Description</label><input type="text" class="mod-desc" data-mod-id="${m.id}" value="${esc(m.description||'')}" placeholder="Brief description"></div>
 
     <div style="margin-top:6px;padding:12px;border:1px solid var(--border);border-radius:var(--r);background:#fff">
-      <p style="font-weight:600;font-size:12px;margin-bottom:4px">📎 Learning content <span style="color:var(--muted);font-weight:400">(add at least one — video, PDF, and/or link)</span></p>
+      <p style="font-weight:600;font-size:12px;margin-bottom:4px">📎 Learning content <span style="color:var(--muted);font-weight:400">(add at least one — uploaded video, PDF, and/or YouTube video)</span></p>
 
       <div class="field" style="margin-top:10px">
         <label>🎬 Video (.mp4 / .webm) — optional</label>
@@ -1372,8 +1416,10 @@ function moduleRow(m, i) {
       </div>
 
       <div class="field" style="margin-bottom:0">
-        <label>🔗 External link (URL) — optional</label>
-        <input type="url" class="mod-url" data-mod-id="${m.id}" value="${esc(m.url||'')}" placeholder="https://example.com/resource">
+        <label>▶ YouTube video link — optional</label>
+        <input type="text" class="mod-yt" data-mod-id="${m.id}" value="${esc(m.ytId||'')}"
+          placeholder="https://www.youtube.com/watch?v=... or youtu.be/... or bare video ID">
+        ${m.ytId ? `<p style="font-size:11px;color:var(--success);margin-top:4px">✅ YouTube video linked (ID: ${esc(m.ytId)})</p>` : ''}
       </div>
     </div>
 
@@ -1423,7 +1469,7 @@ function bindModalEvents() {
   // Add module
   document.getElementById('add-mod-btn')?.addEventListener('click',()=>{
     const count=document.querySelectorAll('#mc-modules .accordion-body[data-mod-id]').length;
-    const m={id:uid(),title:'',dur:'',description:'',video:false,pdf:false,url:'',quiz:[]};
+    const m={id:uid(),title:'',dur:'',description:'',video:false,pdf:false,ytId:'',quiz:[]};
     document.getElementById('mc-modules').insertAdjacentHTML('beforeend',moduleRow(m,count));
     bindDropZones();
     bindRemoveBtns();
@@ -1602,16 +1648,20 @@ async function saveCourseFromModal() {
       modEntries.push({el, mid, t, d, desc});
     });
 
-    // Async pass: gather content sources (video/pdf in IDB, url in DOM) per module
+    // Async pass: gather content sources (video/pdf in IDB, ytId in DOM) per module
     for (const {el, mid, t, d, desc} of modEntries) {
-      // URL field
-      const url = (el.querySelector('.mod-url')?.value || '').trim();
+      // YouTube field
+      const ytRaw = (el.querySelector('.mod-yt')?.value || '').trim();
+      const ytId  = parseYtId(ytRaw);
+      if (ytRaw && !ytId) {
+        errors.push(`Module "${t}": the YouTube link/ID doesn't look valid. Paste the full URL or the 11-character video ID.`);
+      }
       // Video / PDF presence — check IDB for stored blobs
       let hasVideo=false, hasPdf=false;
       try { hasVideo = !!(await IDB.get(mid+'_video')); } catch {}
       try { hasPdf   = !!(await IDB.get(mid+'_pdf'));   } catch {}
-      if (!hasVideo && !hasPdf && !url) {
-        errors.push(`Module "${t}" needs at least one content source (video, PDF, or link).`);
+      if (!hasVideo && !hasPdf && !ytId) {
+        errors.push(`Module "${t}" needs at least one content source (uploaded video, PDF, or YouTube video).`);
       }
       // Collect this module's quiz
       const modQuiz=[];
@@ -1625,7 +1675,7 @@ async function saveCourseFromModal() {
       });
       modules.push({
         id:mid, title:t, dur:d||'—', description:desc, quiz:modQuiz,
-        video: hasVideo, pdf: hasPdf, url: url||''
+        video: hasVideo, pdf: hasPdf, ytId: ytId||''
       });
     }
 
@@ -2062,6 +2112,7 @@ function bindEvents() {
   // Modal events are bound by openModal() directly — not here
   // Video player enforcement
   initVideoPlayer();
+  initYouTubePlayer();
 }
 
 // ═══════════════════════════════════════════════════
@@ -2099,6 +2150,173 @@ function initVideoPlayer() {
   video.addEventListener('contextmenu',e=>e.preventDefault());
   // Block rate change
   video.addEventListener('ratechange',()=>{if(video.playbackRate!==1)video.playbackRate=1;});
+}
+
+// ─────────────────────────────────────────────────────
+// YouTube IFrame Player enforcement
+// ─────────────────────────────────────────────────────
+
+function initYouTubePlayer() {
+  const wrap = document.getElementById('yt-player-wrap');
+  if (!wrap) return;
+  const m   = S.activeModule;
+  const cid = S.activeCourse?.id;
+  if (!m || !m.ytId) return;
+
+  const isAlreadyWatched = (DB.prog(S.session.id)[cid]?.watched || []).includes(m.id);
+  const ytVidId = m.ytId;
+
+  // ── Plain iframe embed with postMessage enforcement ────────────────────────
+  // We intentionally avoid the IFrame JS API (new YT.Player) because it
+  // triggers Error 153 on file:// origins and on any video whose owner has
+  // restricted the API (even if normal embed is allowed). A plain <iframe>
+  // with enablejsapi=1 + postMessage works on all origins.
+  const iframe = document.createElement('iframe');
+  iframe.id    = 'yt-iframe';
+  iframe.setAttribute('width',  '100%');
+  iframe.setAttribute('height', '100%');
+  iframe.style.cssText  = 'border:0;display:block';
+  iframe.allow          = 'autoplay; encrypted-media; fullscreen';
+  iframe.allowFullscreen = true;
+
+  // Only include origin= on real HTTP(S) pages; on file:// it must be omitted.
+  const isHttp = /^https?:/.test(location.protocol);
+  const originParam = isHttp ? `&origin=${encodeURIComponent(location.origin)}` : '';
+  iframe.src = `https://www.youtube.com/embed/${encodeURIComponent(ytVidId)}?enablejsapi=1&rel=0&modestbranding=1&iv_load_policy=3${originParam}`;
+
+  // Swap the placeholder div for the real iframe
+  const placeholder = document.getElementById('yt-player');
+  if (placeholder) placeholder.replaceWith(iframe); else wrap.appendChild(iframe);
+
+  // Already-watched: drop the no-skip shield
+  if (isAlreadyWatched) {
+    const shield = document.getElementById('yt-shield');
+    if (shield) shield.remove();
+  }
+
+  // ── postMessage enforcement ────────────────────────────────────────────────
+  // YouTube broadcasts JSON over window.message:
+  //   {event:"onStateChange", info: <playerState>}
+  //   {event:"infoDelivery",  info: {currentTime, duration, ...}}
+  //   {event:"onError",       info: <errorCode>}
+  // We poll currentTime by sending a getVideoData command each tick.
+
+  let lastTime  = 0;
+  let completed = false;
+  let duration  = 0;
+  let tickTimer = null;
+
+  function ytCmd(func, args) {
+    try {
+      iframe.contentWindow.postMessage(
+        JSON.stringify({ event: 'command', func, args: args || [] }), '*'
+      );
+    } catch(_) {}
+  }
+
+  function startPolling() {
+    clearInterval(tickTimer);
+    tickTimer = setInterval(() => {
+      if (!document.getElementById('yt-iframe')) { clearInterval(tickTimer); return; }
+      ytCmd('getVideoData');
+    }, 500);
+  }
+
+  function stopPolling() { clearInterval(tickTimer); }
+
+  function showEmbedError(code) {
+    stopPolling();
+    window.removeEventListener('message', onMsg);
+    const isEmbedBlocked = [101, 150, 153].includes(code);
+    wrap.innerHTML = `
+      <div style="width:100%;min-height:200px;display:flex;align-items:center;justify-content:center;
+                  background:#0f0f0f;border-radius:6px;padding:24px;box-sizing:border-box">
+        <div style="text-align:center;max-width:340px">
+          <div style="font-size:40px;margin-bottom:12px">${isEmbedBlocked ? '🚫' : '⚠️'}</div>
+          <p style="color:#fff;font-weight:700;font-size:15px;margin-bottom:8px">
+            ${isEmbedBlocked ? 'Embedding disabled for this video' : 'Video unavailable'}
+          </p>
+          <p style="color:rgba(255,255,255,0.55);font-size:12px;margin-bottom:18px;line-height:1.5">
+            ${isEmbedBlocked
+              ? 'The video owner has disabled embedding. Ask your admin to replace this with a video that allows embedding, or upload a video file instead.'
+              : `YouTube error ${code} — the video may be private, deleted, or region-restricted.`}
+          </p>
+          <a href="https://www.youtube.com/watch?v=${encodeURIComponent(ytVidId)}"
+             target="_blank" rel="noopener noreferrer"
+             style="display:inline-block;padding:9px 20px;background:#FF0000;color:#fff;
+                    border-radius:6px;font-size:13px;font-weight:600;text-decoration:none">
+            Watch on YouTube ↗
+          </a>
+        </div>
+      </div>`;
+    const bar = document.getElementById('yt-vpf');
+    if (bar) bar.style.display = 'none';
+  }
+
+  function onMsg(e) {
+    if (!String(e.origin).includes('youtube.com')) return;
+    let data;
+    try { data = typeof e.data === 'string' ? JSON.parse(e.data) : e.data; } catch { return; }
+
+    if (data.event === 'onError') {
+      showEmbedError(Number(data.info));
+      return;
+    }
+
+    if (data.event === 'onStateChange') {
+      const state = Number(data.info);
+      if (state === 1) {       // playing
+        startPolling();
+      } else if (state === 0) { // ended
+        stopPolling();
+        if (!isAlreadyWatched && !completed) {
+          completed = true;
+          window.removeEventListener('message', onMsg);
+          markVideoComplete(m.id, cid);
+        }
+      } else {
+        stopPolling();
+      }
+      return;
+    }
+
+    if (data.event === 'infoDelivery' && data.info) {
+      const info = data.info;
+      if (info.duration > 0)      duration = info.duration;
+      if (info.currentTime != null) {
+        const cur = Number(info.currentTime);
+        const dur = duration;
+
+        const bar = document.getElementById('yt-vpf');
+        if (bar && dur > 0) bar.style.width = (cur / dur * 100) + '%';
+
+        if (!isAlreadyWatched && !completed && dur > 0) {
+          if (cur > lastTime + 4) {
+            ytCmd('seekTo', [lastTime, true]);
+            toast('Please watch the video without skipping ⛔', 'err');
+            return;
+          }
+          lastTime = Math.max(lastTime, cur);
+          if (cur >= dur - 2) {
+            completed = true;
+            stopPolling();
+            window.removeEventListener('message', onMsg);
+            markVideoComplete(m.id, cid);
+          }
+        }
+      }
+    }
+  }
+
+  window.addEventListener('message', onMsg);
+
+  // After iframe loads, subscribe to state-change and error events
+  iframe.addEventListener('load', () => {
+    setTimeout(() => {
+      ytCmd('addEventListener', ['onStateChange']);
+      ytCmd('addEventListener', ['onError']);
+    }, 400);
+  });
 }
 
 function markVideoComplete(mid, cid) {
