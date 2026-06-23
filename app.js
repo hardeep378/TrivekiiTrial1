@@ -1,11 +1,274 @@
 // ═══════════════════════════════════════════════════
-// DATA & STORAGE
+// SUPABASE CONFIG
+// ═══════════════════════════════════════════════════
+const SUPABASE_URL  = 'https://procvnkcvbihsyuthkvv.supabase.co';
+const SUPABASE_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InByb2N2bmtjdmJpaHN5dXRoa3Z2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIxMTM2MTIsImV4cCI6MjA5NzY4OTYxMn0.8sCxhuglrcPkSQ0gGgD4_Cn3-bfa2nchZYxYSDVvh4o';
+
+// ── Supabase REST helper ─────────────────────────────────────────────────────
+// Thin wrapper; no SDK dependency — just fetch().
+const SB = {
+  headers(extra={}) {
+    return {
+      'apikey':        SUPABASE_ANON,
+      'Authorization': 'Bearer ' + SUPABASE_ANON,
+      'Content-Type':  'application/json',
+      'Prefer':        'return=representation',
+      ...extra,
+    };
+  },
+
+  // GET  /rest/v1/<table>?select=...&col=eq.val
+  async select(table, params='') {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${params}`, {
+      headers: this.headers(),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    return r.json();
+  },
+
+  // POST /rest/v1/<table>  (insert one row → returns array)
+  async insert(table, body) {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/${table}`, {
+      method:  'POST',
+      headers: this.headers(),
+      body:    JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    return Array.isArray(data) ? data[0] : data;
+  },
+
+  // PATCH /rest/v1/<table>?col=eq.val
+  async update(table, params, body) {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${params}`, {
+      method:  'PATCH',
+      headers: this.headers(),
+      body:    JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    return Array.isArray(data) ? data[0] : data;
+  },
+
+  // DELETE /rest/v1/<table>?col=eq.val
+  async delete(table, params) {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${params}`, {
+      method:  'DELETE',
+      headers: this.headers({'Prefer':'return=minimal'}),
+    });
+    if (!r.ok) throw new Error(await r.text());
+  },
+
+  // Upsert: insert or update on conflict
+  async upsert(table, body, onConflict) {
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/${table}?on_conflict=${onConflict}`,
+      {
+        method:  'POST',
+        headers: this.headers({'Prefer':'resolution=merge-duplicates,return=representation'}),
+        body:    JSON.stringify(body),
+      }
+    );
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    return Array.isArray(data) ? data[0] : data;
+  },
+
+  // ── Storage: upload a file to a Supabase bucket ───────────────────────────
+  // bucket: 'pdfs'  |  path: '<moduleId>.pdf'
+  async uploadFile(bucket, path, blob, contentType) {
+    const r = await fetch(
+      `${SUPABASE_URL}/storage/v1/object/${bucket}/${path}`,
+      {
+        method:  'POST',
+        headers: {
+          'apikey':        SUPABASE_ANON,
+          'Authorization': 'Bearer ' + SUPABASE_ANON,
+          'Content-Type':  contentType,
+        },
+        body: blob,
+      }
+    );
+    if (!r.ok) {
+      // 409 = already exists → use PUT (upsert)
+      if (r.status === 409) return this.updateFile(bucket, path, blob, contentType);
+      throw new Error(await r.text());
+    }
+    return r.json();
+  },
+
+  async updateFile(bucket, path, blob, contentType) {
+    const r = await fetch(
+      `${SUPABASE_URL}/storage/v1/object/${bucket}/${path}`,
+      {
+        method:  'PUT',
+        headers: {
+          'apikey':        SUPABASE_ANON,
+          'Authorization': 'Bearer ' + SUPABASE_ANON,
+          'Content-Type':  contentType,
+        },
+        body: blob,
+      }
+    );
+    if (!r.ok) throw new Error(await r.text());
+    return r.json();
+  },
+
+  // Public URL for a storage object
+  publicUrl(bucket, path) {
+    return `${SUPABASE_URL}/storage/v1/object/public/${bucket}/${path}`;
+  },
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DATABASE ABSTRACTION  (replaces localStorage/IndexedDB DB object)
+// Tables assumed in Supabase (match your schema):
+//   users        (id text PK, name, email, pw_hash [we store pw plaintext for
+//                 parity with original — upgrade to Supabase Auth later],
+//                 sq, sa, dept, notes, created_at, disabled bool)
+//   courses      (id text PK, data jsonb)   ← whole course as JSON blob
+//   progress     (user_id text, course_id text, data jsonb, PK: user_id+course_id)
+//   settings     (id text PK='global', data jsonb)
+//   retakes      (user_id text, quiz_key text, count int, PK: user_id+quiz_key)
+//   quiz_answers (user_id text, quiz_key text, answers jsonb, PK: user_id+quiz_key)
+//   streaks      (user_id text PK, streak int, last_date text)
+// ─────────────────────────────────────────────────────────────────────────────
+const DB = {
+  // ── In-memory caches to avoid redundant round-trips in the same session ──
+  _users:    null,
+  _courses:  null,
+  _progMap:  {},       // keyed by userId
+  _settings: null,
+
+  // ── USERS ──────────────────────────────────────────────────────────────────
+  async users() {
+    if (this._users) return this._users;
+    const rows = await SB.select('users', 'select=*');
+    this._users = rows;
+    return rows;
+  },
+  async saveUser(u) {
+    // upsert on id
+    await SB.upsert('users', u, 'id');
+    // invalidate cache
+    this._users = null;
+  },
+  async saveUsers(arr) {
+    // Used for bulk writes (disable, delete handled per-record below)
+    // We upsert each changed user
+    for (const u of arr) await SB.upsert('users', u, 'id');
+    this._users = null;
+  },
+  async deleteUser(id) {
+    await SB.delete('users', `id=eq.${id}`);
+    this._users = null;
+    this._progMap[id] = null;
+  },
+
+  // ── COURSES ────────────────────────────────────────────────────────────────
+  async courses() {
+    if (this._courses) return this._courses;
+    const rows = await SB.select('courses', 'select=*');
+    // Each row is { id, data: {...course object} }
+    this._courses = rows.map(r => ({ id: r.id, ...r.data }));
+    return this._courses;
+  },
+  async saveCourse(course) {
+    const { id, ...data } = course;
+    await SB.upsert('courses', { id, data }, 'id');
+    this._courses = null;
+  },
+  async deleteCourse(id) {
+    await SB.delete('courses', `id=eq.${id}`);
+    this._courses = null;
+  },
+
+  // ── PROGRESS ───────────────────────────────────────────────────────────────
+  async prog(userId) {
+    if (this._progMap[userId]) return this._progMap[userId];
+    const rows = await SB.select('progress', `select=*&user_id=eq.${userId}`);
+    // Build the same shape the original code used: { [courseId]: { watched, quizScore, moduleQuiz } }
+    const map = {};
+    for (const r of rows) map[r.course_id] = r.data;
+    this._progMap[userId] = map;
+    return map;
+  },
+  async saveProg(userId, fullMap) {
+    // fullMap = { [courseId]: { watched:[], quizScore, moduleQuiz:{} } }
+    for (const [courseId, data] of Object.entries(fullMap)) {
+      await SB.upsert('progress', { user_id: userId, course_id: courseId, data }, 'user_id,course_id');
+    }
+    this._progMap[userId] = fullMap;
+  },
+  async saveProgCourse(userId, courseId, data) {
+    await SB.upsert('progress', { user_id: userId, course_id: courseId, data }, 'user_id,course_id');
+    if (!this._progMap[userId]) this._progMap[userId] = {};
+    this._progMap[userId][courseId] = data;
+  },
+  async resetProg(userId) {
+    await SB.delete('progress', `user_id=eq.${userId}`);
+    this._progMap[userId] = {};
+  },
+
+  // ── SETTINGS ───────────────────────────────────────────────────────────────
+  async settings() {
+    if (this._settings) return this._settings;
+    const rows = await SB.select('settings', `select=*&id=eq.global`);
+    if (!rows.length) return null;
+    this._settings = rows[0].data;
+    return this._settings;
+  },
+  async saveSettings(data) {
+    await SB.upsert('settings', { id: 'global', data }, 'id');
+    this._settings = data;
+  },
+
+  // ── RETAKE COUNTS ──────────────────────────────────────────────────────────
+  async getRetakeCount(userId, quizKey) {
+    const rows = await SB.select('retakes', `select=count&user_id=eq.${userId}&quiz_key=eq.${encodeURIComponent(quizKey)}`);
+    return rows.length ? (rows[0].count || 0) : 0;
+  },
+  async incrementRetakeCount(userId, quizKey) {
+    const cur = await this.getRetakeCount(userId, quizKey);
+    const next = cur + 1;
+    await SB.upsert('retakes', { user_id: userId, quiz_key: quizKey, count: next }, 'user_id,quiz_key');
+    return next;
+  },
+  async resetRetakes(userId) {
+    await SB.delete('retakes', `user_id=eq.${userId}`);
+  },
+
+  // ── QUIZ ANSWERS ───────────────────────────────────────────────────────────
+  async saveQuizAnswers(userId, quizKey, answers) {
+    await SB.upsert('quiz_answers', { user_id: userId, quiz_key: quizKey, answers }, 'user_id,quiz_key');
+  },
+  async getQuizAnswers(userId, quizKey) {
+    const rows = await SB.select('quiz_answers', `select=answers&user_id=eq.${userId}&quiz_key=eq.${encodeURIComponent(quizKey)}`);
+    return rows.length ? rows[0].answers : null;
+  },
+
+  // ── STREAKS ────────────────────────────────────────────────────────────────
+  async getStreak(userId) {
+    const rows = await SB.select('streaks', `select=*&user_id=eq.${userId}`);
+    if (!rows.length) return { streak: 0, last_date: '' };
+    return rows[0];
+  },
+  async saveStreak(userId, streak, last_date) {
+    await SB.upsert('streaks', { user_id: userId, streak, last_date }, 'user_id');
+  },
+
+  // ── SESSION (stays in sessionStorage — lightweight, no DB round-trip) ──────
+  session()      { try { return JSON.parse(sessionStorage.getItem('trv_sess')||'null'); } catch { return null; } },
+  saveSession(s) { sessionStorage.setItem('trv_sess', JSON.stringify(s)); },
+  clearSession() { sessionStorage.removeItem('trv_sess'); },
+};
+
+// ═══════════════════════════════════════════════════
+// CONSTANTS
 // ═══════════════════════════════════════════════════
 const ADMIN_EMAIL = 'admin@trivekii.com';
 const ADMIN_PW    = 'Admin@123';
 
-// Default courses seeded on first run
-// New model: each module can have its own quiz; course also has a final quiz.
 const DEFAULT_COURSES = [
   { id:'c1', title:'Sample Course', cat:'General', catClass:'badge-blue',
     modules:[
@@ -30,174 +293,103 @@ const DEFAULT_COURSES = [
   }
 ];
 
-const DB = {
-  users()       { try{return JSON.parse(localStorage.getItem('trv_users')||'[]')}catch{return[]} },
-  saveUsers(u)  { localStorage.setItem('trv_users',JSON.stringify(u)) },
-  courses()     { try{return JSON.parse(localStorage.getItem('trv_courses_v3')||'null')}catch{return null} },
-  saveCourses(c){ localStorage.setItem('trv_courses_v3',JSON.stringify(c)) },
-  prog(uid)     { try{return JSON.parse(localStorage.getItem('trv_prog_'+uid)||'{}')}catch{return{}} },
-  saveProg(uid,p){ localStorage.setItem('trv_prog_'+uid,JSON.stringify(p)) },
-  session()     { try{return JSON.parse(localStorage.getItem('trv_sess')||'null')}catch{return null} },
-  saveSession(s){ localStorage.setItem('trv_sess',JSON.stringify(s)) },
-  clearSession(){ localStorage.removeItem('trv_sess') },
-  // blob methods delegated to IDB (defined below after DB)
-  blob(id)       { return null; }, // sync stub — use IDB.get() async instead
-  saveBlob(id,b) { return true; }, // sync stub — use IDB.save() async instead
-  deleteBlob(id) { IDB.delete(id); },
-  // quiz settings
-  settings()     { try{return JSON.parse(localStorage.getItem('trv_settings')||'null')}catch{return null} },
-  saveSettings(s){ localStorage.setItem('trv_settings',JSON.stringify(s)) },
-};
-
-
-// ── IndexedDB for binary file storage (videos/PDFs) ──────────────────────────
-const IDB = (() => {
-  const DB_NAME = 'trivekii_blobs', STORE = 'blobs', VERSION = 1;
-  let _db = null;
-  function open() {
-    return new Promise((res, rej) => {
-      if (_db) { res(_db); return; }
-      const req = indexedDB.open(DB_NAME, VERSION);
-      req.onupgradeneeded = e => e.target.result.createObjectStore(STORE);
-      req.onsuccess = e => { _db = e.target.result; res(_db); };
-      req.onerror   = e => rej(e.target.error);
-    });
-  }
-  return {
-    async save(id, data) {
-      const db = await open();
-      return new Promise((res, rej) => {
-        const tx = db.transaction(STORE, 'readwrite');
-        tx.objectStore(STORE).put(data, id);
-        tx.oncomplete = () => res(true);
-        tx.onerror    = e => rej(e.target.error);
-      });
-    },
-    async get(id) {
-      const db = await open();
-      return new Promise((res, rej) => {
-        const req = db.transaction(STORE).objectStore(STORE).get(id);
-        req.onsuccess = e => res(e.target.result || null);
-        req.onerror   = e => rej(e.target.error);
-      });
-    },
-    async delete(id) {
-      const db = await open();
-      return new Promise((res, rej) => {
-        const tx = db.transaction(STORE, 'readwrite');
-        tx.objectStore(STORE).delete(id);
-        tx.oncomplete = () => res();
-        tx.onerror    = e => rej(e.target.error);
-      });
-    },
-  };
-})();
-
-// Init courses if first visit
-let COURSES = DB.courses();
-if (!COURSES) { COURSES = DEFAULT_COURSES; DB.saveCourses(COURSES); }
-
-function saveCourses() { DB.saveCourses(COURSES); }
-
-// Quiz settings (admin-controlled, defaults: 80% pass, 2 retakes)
 const DEFAULT_SETTINGS = { passThreshold: 80, maxRetakes: 2 };
-let SETTINGS = DB.settings() || DEFAULT_SETTINGS;
-function saveSettings() { DB.saveSettings(SETTINGS); }
+
+// ═══════════════════════════════════════════════════
+// GLOBALS (populated async on boot)
+// ═══════════════════════════════════════════════════
+let COURSES  = [];
+let SETTINGS = { ...DEFAULT_SETTINGS };
 
 // ═══════════════════════════════════════════════════
 // STATE
 // ═══════════════════════════════════════════════════
 let S = {
-  session: null,
-  tab: 'dashboard',
+  session:      null,
+  tab:          'dashboard',
   activeCourse: null,
   activeModule: null,
-  quiz: null,
+  quiz:         null,
   selectedUser: null,
-  authMode: 'login',
-  adminSubTab: 'info',
+  authMode:     'login',
+  adminSubTab:  'info',
   videoWatched: {},
-  _videoUrl: null,  // preloaded video blob (data URI) for active module
-  _pdfUrl: null,    // preloaded PDF blob (data URI) for active module
-  _ytId: null,      // YouTube video ID for active module
-  _contentTab: null, // which content the learner is viewing: 'video'|'pdf'|'youtube'
+  _pdfUrl:      null,   // object-URL for a PDF loaded from Supabase storage
+  _ytId:        null,
+  _contentTab:  null,
+  // Async user/progress caches used during a rendered page
+  _allUsers:    null,
+  _allProg:     {},     // { [uid]: progMap }
 };
 
 // ═══════════════════════════════════════════════════
 // UTILS
 // ═══════════════════════════════════════════════════
 function uid() { return 'id_'+Date.now()+'_'+Math.random().toString(36).slice(2,7); }
+
 function calcCourseProg(userId, cid) {
   const c = COURSES.find(x=>x.id===cid); if(!c||!c.modules.length) return 0;
-  const complete = c.modules.filter(m=>isModuleComplete(userId, cid, m.id)).length;
+  const p = S._allProg[userId] || {};
+  const complete = c.modules.filter(m=>isModuleComplete(userId, cid, m.id, p)).length;
   return Math.round(complete/c.modules.length*100);
 }
 function calcOverall(userId) {
+  const p = S._allProg[userId] || {};
   const total    = COURSES.reduce((a,c)=>a+c.modules.length,0);
-  const complete = COURSES.reduce((a,c)=>a+c.modules.filter(m=>isModuleComplete(userId,c.id,m.id)).length,0);
+  const complete = COURSES.reduce((a,c)=>a+c.modules.filter(m=>isModuleComplete(userId,c.id,m.id,p)).length,0);
   return total ? Math.round(complete/total*100) : 0;
 }
-// ── Per-module quiz helpers ──────────────────────────────────────────────────
-// Returns the score a learner got on a module's quiz (or null if not taken)
-function getModuleQuizScore(userId, cid, mid) {
-  const p = DB.prog(userId);
+
+function getModuleQuizScore(userId, cid, mid, progMap) {
+  const p = progMap || S._allProg[userId] || {};
   return p[cid]?.moduleQuiz?.[mid] ?? null;
 }
-// A module is "complete" if it's watched AND (has no quiz OR its quiz is passed)
-function isModuleComplete(userId, cid, mid) {
+function isModuleComplete(userId, cid, mid, progMap) {
   const c = COURSES.find(x=>x.id===cid); if(!c) return false;
   const mod = c.modules.find(m=>m.id===mid); if(!mod) return false;
-  const watched = (DB.prog(userId)[cid]?.watched||[]).includes(mid);
+  const p = progMap || S._allProg[userId] || {};
+  const watched = (p[cid]?.watched||[]).includes(mid);
   if (!watched) return false;
   const hasQuiz = mod.quiz && mod.quiz.length>0;
   if (!hasQuiz) return true;
-  const sc = getModuleQuizScore(userId, cid, mid);
+  const sc = getModuleQuizScore(userId, cid, mid, p);
   return sc != null && sc >= SETTINGS.passThreshold;
 }
-// A module is unlocked if it's the first, or the previous module is complete
-function isModuleUnlocked(userId, cid, modIndex) {
+function isModuleUnlocked(userId, cid, modIndex, progMap) {
   if (modIndex === 0) return true;
   const c = COURSES.find(x=>x.id===cid); if(!c) return false;
   const prevMod = c.modules[modIndex-1];
-  return isModuleComplete(userId, cid, prevMod.id);
+  return isModuleComplete(userId, cid, prevMod.id, progMap);
 }
-// Are all modules in a course complete? (gates the final course quiz)
-function allModulesComplete(userId, cid) {
+function allModulesComplete(userId, cid, progMap) {
   const c = COURSES.find(x=>x.id===cid); if(!c) return false;
-  return c.modules.every(m=>isModuleComplete(userId, cid, m.id));
+  return c.modules.every(m=>isModuleComplete(userId, cid, m.id, progMap));
 }
-
-// A course is fully passed when all modules are complete AND
-// (there is no final quiz, OR the final quiz is passed)
-function isCoursePassed(userId, cid) {
+function isCoursePassed(userId, cid, progMap) {
   const c = COURSES.find(x=>x.id===cid); if(!c) return false;
-  if (!allModulesComplete(userId, cid)) return false;
+  const p = progMap || S._allProg[userId] || {};
+  if (!allModulesComplete(userId, cid, p)) return false;
   const hasFinal = c.quiz && c.quiz.length>0;
   if (!hasFinal) return true;
-  const sc = DB.prog(userId)[cid]?.quizScore;
+  const sc = p[cid]?.quizScore;
   return sc != null && sc >= SETTINGS.passThreshold;
 }
 
 function statusBadge(pct) {
   if(pct>=SETTINGS.passThreshold) return '<span class="badge badge-green">On track</span>';
-  if(pct>=30) return '<span class="badge badge-orange">In progress</span>';
+  if(pct>=30)                     return '<span class="badge badge-orange">In progress</span>';
   return '<span class="badge badge-red">At risk</span>';
 }
 function esc(str) {
   return String(str||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
-
-// Extract YouTube video ID from various URL formats (or bare ID)
 function parseYtId(raw) {
   if (!raw) return '';
   raw = raw.trim();
-  // youtu.be/ID
   let m = raw.match(/youtu\.be\/([A-Za-z0-9_-]{11})/);
   if (m) return m[1];
-  // youtube.com/watch?v=ID or /embed/ID or /v/ID
   m = raw.match(/(?:youtube\.com\/(?:watch\?v=|embed\/|v\/|shorts\/))([A-Za-z0-9_-]{11})/);
   if (m) return m[1];
-  // bare 11-char video ID
   if (/^[A-Za-z0-9_-]{11}$/.test(raw)) return raw;
   return '';
 }
@@ -209,6 +401,7 @@ function toast(msg, type='ok') {
   tc.appendChild(t);
   setTimeout(()=>t.remove(), 3500);
 }
+function quizKey(cid, mid) { return mid ? cid+'_mod_'+mid : cid; }
 
 // ═══════════════════════════════════════════════════
 // AUTH
@@ -219,28 +412,27 @@ const appScreen  = document.getElementById('app-screen');
 function showMsg(html, type='err') {
   document.getElementById('auth-msg').innerHTML = `<div class="msg-${type}">${html}</div>`;
 }
+
 function setAuthMode(mode) {
   S.authMode = mode;
   const isLogin    = mode==='login';
   const isRegister = mode==='register';
   const isReset    = mode==='reset' || mode==='reset-answer' || mode==='reset-pw';
-  document.getElementById('auth-title').textContent       = isLogin?'Welcome back':isRegister?'Create account':'Reset password';
-  document.getElementById('auth-subtitle').textContent    = isLogin?'Sign in to your Trivekii account':isRegister?'Register as a learner to get started':'We\'ll verify your identity first';
-  document.getElementById('auth-submit-btn').textContent  = isLogin?'Sign in →':isRegister?'Create account →':mode==='reset'?'Find my account →':mode==='reset-answer'?'Verify answer →':'Set new password →';
-  document.getElementById('auth-switch-text').textContent = isLogin?"Don't have an account?":isRegister?'Already have an account?':'Remember your password?';
-  document.getElementById('auth-toggle').textContent      = isLogin?' Register here':isRegister?' Sign in':' Sign in';
-  document.getElementById('field-name').style.display     = isRegister?'':'none';
-  document.getElementById('field-pw2').style.display      = isRegister||mode==='reset-pw'?'':'none';
-  document.getElementById('field-sq').style.display       = isRegister?'':'none';
-  document.getElementById('field-sa').style.display       = isRegister||mode==='reset-answer'?'':'none';
-  // Email field: hide during answer/pw steps
+  document.getElementById('auth-title').textContent      = isLogin?'Welcome back':isRegister?'Create account':'Reset password';
+  document.getElementById('auth-subtitle').textContent   = isLogin?'Sign in to your Trivekii account':isRegister?'Register as a learner to get started':'We\'ll verify your identity first';
+  document.getElementById('auth-submit-btn').textContent = isLogin?'Sign in →':isRegister?'Create account →':mode==='reset'?'Find my account →':mode==='reset-answer'?'Verify answer →':'Set new password →';
+  document.getElementById('auth-switch-text').textContent= isLogin?"Don't have an account?":isRegister?'Already have an account?':'Remember your password?';
+  document.getElementById('auth-toggle').textContent     = isLogin?' Register here':isRegister?' Sign in':' Sign in';
+  document.getElementById('field-name').style.display    = isRegister?'':'none';
+  document.getElementById('field-pw2').style.display     = isRegister||mode==='reset-pw'?'':'none';
+  document.getElementById('field-sq').style.display      = isRegister?'':'none';
+  document.getElementById('field-sa').style.display      = isRegister||mode==='reset-answer'?'':'none';
   document.getElementById('inp-email').closest('.field').style.display = mode==='reset-answer'||mode==='reset-pw'?'none':'';
-  // Password field: hide during reset email lookup and answer steps
   document.getElementById('inp-pw').closest('.field').style.display    = mode==='reset'||mode==='reset-answer'?'none':'';
-  // Forgot link: only on login
   document.getElementById('forgot-row').style.display = isLogin?'':'none';
   document.getElementById('auth-msg').innerHTML = '';
 }
+
 document.getElementById('auth-toggle').addEventListener('click',()=>{
   if(S.authMode==='login') setAuthMode('register');
   else setAuthMode('login');
@@ -249,120 +441,184 @@ document.getElementById('forgot-link').addEventListener('click',()=>setAuthMode(
 document.getElementById('auth-submit-btn').addEventListener('click', doAuth);
 document.addEventListener('keydown', e=>{if(e.key==='Enter'&&authScreen.style.display!=='none')doAuth();});
 
-function doAuth() {
-  const email = document.getElementById('inp-email').value.trim();
+async function doAuth() {
+  const email = document.getElementById('inp-email').value.trim().toLowerCase();
   const pw    = document.getElementById('inp-pw').value;
+  const btn   = document.getElementById('auth-submit-btn');
   document.getElementById('auth-msg').innerHTML='';
 
-  // ── LOGIN ──
-  if (S.authMode==='login') {
-    const adminPw = localStorage.getItem('trv_admin_pw_override')||ADMIN_PW;
-    if (email===ADMIN_EMAIL && pw===adminPw) {
-      launch({role:'admin', email, name:'Admin', id:'admin'});
-    } else {
-      const u = DB.users().find(x=>x.email===email && x.pw===pw);
-      if (!u) { showMsg('Incorrect email or password.'); return; }
-      if (u.disabled) { showMsg('This account has been disabled. Contact your administrator.'); return; }
-      launch({role:'learner', email:u.email, name:u.name, id:u.id});
-    }
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>';
 
-  // ── REGISTER ──
-  } else if (S.authMode==='register') {
-    const name = document.getElementById('inp-name').value.trim();
-    const pw2  = document.getElementById('inp-pw2').value;
-    const sq   = document.getElementById('inp-sq').value;
-    const sa   = document.getElementById('inp-sa').value.trim();
-    if (!name)                { showMsg('Please enter your full name.'); return; }
-    if (!email.includes('@')) { showMsg('Please enter a valid email.'); return; }
-    if (pw.length<6)          { showMsg('Password must be at least 6 characters.'); return; }
-    if (pw!==pw2)             { showMsg('Passwords do not match.'); return; }
-    if (!sq)                  { showMsg('Please choose a security question.'); return; }
-    if (!sa)                  { showMsg('Please provide your security answer.'); return; }
-    const users = DB.users();
-    if (users.find(x=>x.email===email)) { showMsg('This email is already registered.'); return; }
-    const nu = {id:'u_'+Date.now(), name, email, pw, sq, sa:sa.toLowerCase().trim(),
-                createdAt:new Date().toISOString(), disabled:false, dept:'', notes:''};
-    DB.saveUsers([...users, nu]);
-    showMsg('Account created! You can now sign in.','ok');
-    setAuthMode('login');
-    document.getElementById('inp-email').value = email;
+  try {
+    // ── LOGIN ──
+    if (S.authMode==='login') {
+      const adminPw = sessionStorage.getItem('trv_admin_pw_override') || ADMIN_PW;
+      if (email===ADMIN_EMAIL && pw===adminPw) {
+        await boot({role:'admin', email, name:'Admin', id:'admin'});
+      } else {
+        const users = await DB.users();
+        const u = users.find(x=>x.email===email && x.pw===pw);
+        if (!u) { showMsg('Incorrect email or password.'); return; }
+        if (u.disabled) { showMsg('This account has been disabled. Contact your administrator.'); return; }
+        await boot({role:'learner', email:u.email, name:u.name, id:u.id});
+      }
 
-  // ── RESET STEP 1: find account by email ──
-  } else if (S.authMode==='reset') {
-    if (!email) { showMsg('Please enter your email address.'); return; }
-    if (email===ADMIN_EMAIL) {
-      // Admin reset: use a special PIN stored in localStorage (admin sets it themselves)
+    // ── REGISTER ──
+    } else if (S.authMode==='register') {
+      const name = document.getElementById('inp-name').value.trim();
+      const pw2  = document.getElementById('inp-pw2').value;
+      const sq   = document.getElementById('inp-sq').value;
+      const sa   = document.getElementById('inp-sa').value.trim();
+      if (!name)                { showMsg('Please enter your full name.'); return; }
+      if (!email.includes('@')) { showMsg('Please enter a valid email.'); return; }
+      if (pw.length<6)          { showMsg('Password must be at least 6 characters.'); return; }
+      if (pw!==pw2)             { showMsg('Passwords do not match.'); return; }
+      if (!sq)                  { showMsg('Please choose a security question.'); return; }
+      if (!sa)                  { showMsg('Please provide your security answer.'); return; }
+      const users = await DB.users();
+      if (users.find(x=>x.email===email)) { showMsg('This email is already registered.'); return; }
+      const nu = {
+        id: 'u_'+Date.now(), name, email, pw, sq,
+        sa: sa.toLowerCase().trim(),
+        created_at: new Date().toISOString(), disabled: false, dept: '', notes: '',
+      };
+      await DB.saveUser(nu);
+      showMsg('Account created! You can now sign in.','ok');
+      setAuthMode('login');
+      document.getElementById('inp-email').value = email;
+
+    // ── RESET STEP 1 ──
+    } else if (S.authMode==='reset') {
+      if (!email) { showMsg('Please enter your email address.'); return; }
+      if (email===ADMIN_EMAIL) {
+        S._resetEmail = email;
+        S._resetIsAdmin = true;
+        setAuthMode('reset-answer');
+        document.getElementById('field-sa').querySelector('label').textContent = 'Admin PIN (set in Settings)';
+        document.getElementById('field-sa').querySelector('input').placeholder = 'Enter your admin PIN';
+        showMsg('Enter your admin PIN to reset the admin password.','ok');
+        return;
+      }
+      const users = await DB.users();
+      const u = users.find(x=>x.email===email);
+      if (!u) { showMsg('No account found with that email address.'); return; }
+      if (!u.sq || !u.sa) { showMsg('This account has no security question set. Please contact your administrator.'); return; }
       S._resetEmail = email;
-      S._resetIsAdmin = true;
+      S._resetIsAdmin = false;
       setAuthMode('reset-answer');
-      const sqField = document.getElementById('field-sa');
-      // Repurpose the sa label for admin PIN
-      sqField.querySelector('label').textContent = 'Admin PIN (set in Settings)';
-      sqField.querySelector('input').placeholder = 'Enter your admin PIN';
-      showMsg('Enter your admin PIN to reset the admin password.','ok');
-      return;
-    }
-    const u = DB.users().find(x=>x.email===email);
-    if (!u) { showMsg('No account found with that email address.'); return; }
-    if (!u.sq || !u.sa) { showMsg('This account has no security question set. Please contact your administrator to reset your password.'); return; }
-    S._resetEmail = email;
-    S._resetIsAdmin = false;
-    setAuthMode('reset-answer');
-    // Show the actual question
-    const sqMap = {
-      pet:"What was the name of your first pet?",
-      city:"What city were you born in?",
-      mother:"What is your mother's maiden name?",
-      school:"What was the name of your primary school?",
-      friend:"What is the name of your childhood best friend?"
-    };
-    const saField = document.getElementById('field-sa');
-    saField.querySelector('label').innerHTML = `Security question: <strong>${sqMap[u.sq]||u.sq}</strong>`;
-    saField.querySelector('input').placeholder = 'Your answer';
-    saField.querySelector('input').value = '';
+      const sqMap = {pet:"What was the name of your first pet?",city:"What city were you born in?",mother:"What is your mother's maiden name?",school:"What was the name of your primary school?",friend:"What is the name of your childhood best friend?"};
+      const saField = document.getElementById('field-sa');
+      saField.querySelector('label').innerHTML = `Security question: <strong>${sqMap[u.sq]||u.sq}</strong>`;
+      saField.querySelector('input').placeholder = 'Your answer';
+      saField.querySelector('input').value = '';
 
-  // ── RESET STEP 2: verify security answer ──
-  } else if (S.authMode==='reset-answer') {
-    const answer = document.getElementById('inp-sa').value.trim().toLowerCase();
-    if (!answer) { showMsg('Please enter your answer.'); return; }
-    if (S._resetIsAdmin) {
-      const storedPin = localStorage.getItem('trv_admin_pin')||'';
-      if (!storedPin) { showMsg('No admin PIN has been set. Please set one in Settings first.'); return; }
-      if (answer !== storedPin) { showMsg('Incorrect PIN. Try again.'); return; }
-    } else {
-      const u = DB.users().find(x=>x.email===S._resetEmail);
-      if (!u) { showMsg('Account not found.'); return; }
-      if (answer !== u.sa) { showMsg('Incorrect answer. Please try again.'); return; }
-    }
-    setAuthMode('reset-pw');
-    showMsg('Identity verified! Set your new password below.','ok');
+    // ── RESET STEP 2 ──
+    } else if (S.authMode==='reset-answer') {
+      const answer = document.getElementById('inp-sa').value.trim().toLowerCase();
+      if (!answer) { showMsg('Please enter your answer.'); return; }
+      if (S._resetIsAdmin) {
+        const storedPin = sessionStorage.getItem('trv_admin_pin') || localStorage.getItem('trv_admin_pin') || '';
+        if (!storedPin) { showMsg('No admin PIN has been set. Please set one in Settings first.'); return; }
+        if (answer !== storedPin) { showMsg('Incorrect PIN. Try again.'); return; }
+      } else {
+        const users = await DB.users();
+        const u = users.find(x=>x.email===S._resetEmail);
+        if (!u) { showMsg('Account not found.'); return; }
+        if (answer !== u.sa) { showMsg('Incorrect answer. Please try again.'); return; }
+      }
+      setAuthMode('reset-pw');
+      showMsg('Identity verified! Set your new password below.','ok');
 
-  // ── RESET STEP 3: set new password ──
-  } else if (S.authMode==='reset-pw') {
-    const pw2 = document.getElementById('inp-pw2').value;
-    if (pw.length<6)  { showMsg('Password must be at least 6 characters.'); return; }
-    if (pw!==pw2)     { showMsg('Passwords do not match.'); return; }
-    if (S._resetIsAdmin) {
-      // Admin password is hardcoded — store override in localStorage
-      localStorage.setItem('trv_admin_pw_override', pw);
-      showMsg('Admin password updated! You can now sign in.','ok');
-    } else {
-      const users = DB.users();
-      const idx = users.findIndex(x=>x.email===S._resetEmail);
-      if (idx===-1) { showMsg('Account not found.'); return; }
-      users[idx].pw = pw;
-      DB.saveUsers(users);
-      showMsg('Password updated! You can now sign in.','ok');
+    // ── RESET STEP 3 ──
+    } else if (S.authMode==='reset-pw') {
+      const pw2 = document.getElementById('inp-pw2').value;
+      if (pw.length<6)  { showMsg('Password must be at least 6 characters.'); return; }
+      if (pw!==pw2)     { showMsg('Passwords do not match.'); return; }
+      if (S._resetIsAdmin) {
+        sessionStorage.setItem('trv_admin_pw_override', pw);
+        localStorage.setItem('trv_admin_pw_override', pw);
+        showMsg('Admin password updated! You can now sign in.','ok');
+      } else {
+        const users = await DB.users();
+        const u = users.find(x=>x.email===S._resetEmail);
+        if (!u) { showMsg('Account not found.'); return; }
+        await DB.saveUser({...u, pw});
+        showMsg('Password updated! You can now sign in.','ok');
+      }
+      S._resetEmail = null; S._resetIsAdmin = false;
+      setTimeout(()=>setAuthMode('login'), 1500);
     }
-    S._resetEmail = null;
-    S._resetIsAdmin = false;
-    setTimeout(()=>setAuthMode('login'), 1500);
+
+  } catch(err) {
+    showMsg('Error: ' + err.message);
+    console.error(err);
+  } finally {
+    btn.disabled = false;
+    // Restore correct label
+    const labels = {login:'Sign in →',register:'Create account →',reset:'Find my account →','reset-answer':'Verify answer →','reset-pw':'Set new password →'};
+    btn.textContent = labels[S.authMode] || 'Submit';
   }
 }
 
-function launch(session) {
+// ─── Boot: load all remote data then render ─────────────────────────────────
+async function boot(session) {
   S.session = session;
   DB.saveSession(session);
+
+  showLoadingOverlay('Loading your workspace…');
+  try {
+    // Load courses + settings in parallel
+    const [remoteCourses, remoteSettings] = await Promise.all([
+      DB.courses(),
+      DB.settings(),
+    ]);
+
+    if (!remoteCourses.length) {
+      // Seed default courses on first run
+      for (const c of DEFAULT_COURSES) await DB.saveCourse(c);
+      COURSES = DEFAULT_COURSES.slice();
+    } else {
+      COURSES = remoteCourses;
+    }
+
+    SETTINGS = remoteSettings || DEFAULT_SETTINGS;
+    if (!remoteSettings) await DB.saveSettings(SETTINGS);
+
+    // Pre-load current user's progress
+    if (session.role === 'learner') {
+      const p = await DB.prog(session.id);
+      S._allProg[session.id] = p;
+    } else {
+      // Admin: pre-load all users' progress for stats
+      await refreshAllStats();
+    }
+
+    launch(session);
+  } catch(err) {
+    hideLoadingOverlay();
+    showMsg('Failed to load data: ' + err.message);
+    console.error(err);
+  }
+}
+
+function showLoadingOverlay(msg) {
+  let el = document.getElementById('load-overlay');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'load-overlay';
+    el.style.cssText = 'position:fixed;inset:0;background:var(--paper);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:999;gap:16px';
+    el.innerHTML = `<div class="spinner" style="width:36px;height:36px;border-width:3px;border-top-color:var(--accent)"></div><p style="font-size:14px;color:var(--muted)">${msg}</p>`;
+    document.body.appendChild(el);
+  }
+}
+function hideLoadingOverlay() {
+  document.getElementById('load-overlay')?.remove();
+}
+
+function launch(session) {
+  hideLoadingOverlay();
+  S.session = session;
   authScreen.style.display = 'none';
   appScreen.style.display  = 'flex';
   document.getElementById('nav-username').textContent = session.name;
@@ -376,7 +632,12 @@ function launch(session) {
 
 document.getElementById('logout-btn').addEventListener('click',()=>{
   DB.clearSession();
-  S = {session:null,tab:'dashboard',activeCourse:null,activeModule:null,quiz:null,selectedUser:null,authMode:'login',adminSubTab:'info',videoWatched:{},_videoUrl:null,_pdfUrl:null,_ytId:null,_contentTab:null};
+  // Revoke any object URLs
+  if (S._pdfUrl && S._pdfUrl.startsWith('blob:')) URL.revokeObjectURL(S._pdfUrl);
+  S = {session:null,tab:'dashboard',activeCourse:null,activeModule:null,quiz:null,selectedUser:null,authMode:'login',adminSubTab:'info',videoWatched:{},_pdfUrl:null,_ytId:null,_contentTab:null,_allUsers:null,_allProg:{}};
+  COURSES = []; SETTINGS = {...DEFAULT_SETTINGS};
+  // Reset DB caches
+  DB._users=null; DB._courses=null; DB._progMap={}; DB._settings=null;
   appScreen.style.display  = 'none';
   authScreen.style.display = 'grid';
   document.getElementById('topnav').classList.remove('admin-nav');
@@ -385,6 +646,29 @@ document.getElementById('logout-btn').addEventListener('click',()=>{
   document.getElementById('inp-email').value = '';
   document.getElementById('inp-pw').value = '';
 });
+
+// ─── Admin: load all users + their progress for stats ───────────────────────
+async function refreshAllStats() {
+  const users = await DB.users();
+  S._allUsers = users;
+  // Load all progress in parallel
+  await Promise.all(users.map(async u => {
+    const p = await DB.prog(u.id);
+    S._allProg[u.id] = p;
+  }));
+}
+
+function getAllStats() {
+  const users = S._allUsers || [];
+  return users.map(u=>{
+    const p = S._allProg[u.id] || {};
+    const overall=calcOverall(u.id);
+    const qDone=COURSES.filter(c=>p[c.id]?.quizScore!=null).length;
+    const passed=COURSES.filter(c=>isCoursePassed(u.id,c.id,p)).length;
+    const avgQ=COURSES.length?Math.round(COURSES.filter(c=>p[c.id]?.quizScore!=null).reduce((a,c)=>a+(p[c.id]?.quizScore||0),0)/Math.max(1,COURSES.filter(c=>p[c.id]?.quizScore!=null).length)):0;
+    return {...u, overall, qDone, passed, avgQ, p};
+  });
+}
 
 // ═══════════════════════════════════════════════════
 // SIDEBAR
@@ -429,19 +713,29 @@ function render() {
   bindEvents();
 }
 
-// Call this before render() whenever the active module changes
 async function loadAndRender(preferredTab) {
-  S._videoUrl = null; S._pdfUrl = null; S._ytId = null; S._contentTab = null;
+  S._pdfUrl = null; S._ytId = null; S._contentTab = null;
   if (S.activeCourse && S.activeModule && S.activeModule.id) {
     const m = S.activeModule;
-    try { if (m.video) S._videoUrl = await IDB.get(m.id+'_video'); } catch(e){}
-    try { if (m.pdf)   S._pdfUrl   = await IDB.get(m.id+'_pdf');   } catch(e){}
     if (m.ytId) S._ytId = m.ytId;
-    // Pick which content to show first: explicit preference, else video > youtube > pdf
+
+    // PDF: fetch from Supabase storage and create a local object URL
+    if (m.pdf) {
+      try {
+        const pdfPublicUrl = SB.publicUrl('pdfs', m.id + '.pdf');
+        const res = await fetch(pdfPublicUrl, { headers: { 'apikey': SUPABASE_ANON } });
+        if (res.ok) {
+          const blob = await res.blob();
+          S._pdfUrl = URL.createObjectURL(blob);
+        }
+      } catch(e) { console.warn('PDF fetch failed', e); }
+    }
+
+    // Videos: served directly via YouTube (ytId) or the module.videoUrl field
+    // (admins store YouTube IDs; uploaded videos are not supported in Supabase free tier for large files)
     const avail = [];
-    if (S._videoUrl) avail.push('video');
-    if (S._ytId)     avail.push('youtube');
-    if (S._pdfUrl)   avail.push('pdf');
+    if (m.ytId)   avail.push('youtube');
+    if (S._pdfUrl) avail.push('pdf');
     S._contentTab = (preferredTab && avail.includes(preferredTab)) ? preferredTab : (avail[0]||null);
   }
   render();
@@ -459,12 +753,17 @@ function renderLearner() {
   return renderLearnerDashboard();
 }
 
+function currentProg() {
+  return S._allProg[S.session.id] || {};
+}
+
 function renderLearnerDashboard() {
-  const uid = S.session.id; const p = DB.prog(uid);
+  const uid = S.session.id;
+  const p   = currentProg();
   const overall   = calcOverall(uid);
-  const completed = COURSES.filter(c=>isCoursePassed(uid,c.id)).length;
+  const completed = COURSES.filter(c=>isCoursePassed(uid,c.id,p)).length;
   const quizDone  = COURSES.filter(c=>p[c.id]?.quizScore!=null).length;
-  const streak    = getStreakDays(uid);
+  const streak    = S._streak || 0;
   return `<div class="fade">
     <h1 class="page-title">Hello, ${esc(S.session.name.split(' ')[0])} 👋</h1>
     <p class="page-sub">Here's your learning summary today.</p>
@@ -488,22 +787,15 @@ function renderLearnerDashboard() {
         <div class="prog-bg" style="flex:1;height:10px"><div class="prog-fill" style="width:${overall}%;background:var(--accent);height:10px;border-radius:5px"></div></div>
         <span style="font-weight:700;font-size:16px">${overall}%</span>
       </div>
-      <div style="display:flex;gap:16px;font-size:11px;color:var(--muted);margin-bottom:20px;flex-wrap:wrap">
-        <span><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--accent);vertical-align:middle;margin-right:5px"></span>Content viewed = modules watched/read</span>
-        <span><span class="badge badge-green" style="padding:1px 7px;font-size:9px">Quiz</span> = your score on the course test</span>
-      </div>
       ${COURSES.map(c=>{
         const pct=calcCourseProg(uid,c.id);
         const sc=p[c.id]?.quizScore;
-        const wl=p[c.id]?.watched||[];
-        const passed = sc!=null && sc>=SETTINGS.passThreshold;
-        // Determine clear status
+        const passed=sc!=null&&sc>=SETTINGS.passThreshold;
         let statusPill;
-        if (passed && pct===100) statusPill = `<span class="badge badge-green">✓ Completed</span>`;
-        else if (pct===100 && sc==null) statusPill = `<span class="badge badge-orange">Quiz pending</span>`;
-        else if (pct===100 && !passed) statusPill = `<span class="badge badge-red">Quiz not passed</span>`;
-        else if (pct>0) statusPill = `<span class="badge badge-blue">In progress</span>`;
-        else statusPill = `<span class="badge badge-gray">Not started</span>`;
+        if(isCoursePassed(uid,c.id,p)) statusPill=`<span class="badge badge-green">✓ Passed</span>`;
+        else if(pct>0) statusPill=`<span class="badge badge-orange">In progress</span>`;
+        else statusPill=`<span class="badge badge-gray">Not started</span>`;
+        const wl=p[c.id]?.watched||[];
         return `<div style="margin-bottom:18px;padding-bottom:18px;border-bottom:1px solid var(--border)">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
             <span style="font-size:14px;font-weight:600">${esc(c.title)}</span>
@@ -531,40 +823,15 @@ function renderLearnerDashboard() {
   </div>`;
 }
 
-function getStreakDays(uid) {
-  // Simple streak: check last activity date
-  const p = DB.prog(uid);
-  const key = 'trv_streak_'+uid;
-  try {
-    const d = JSON.parse(localStorage.getItem(key)||'{"streak":0,"lastDate":""}');
-    const today = new Date().toDateString();
-    if (d.lastDate===today) return d.streak;
-    const yesterday = new Date(Date.now()-86400000).toDateString();
-    if (d.lastDate===yesterday) return d.streak; // maintain
-    return d.streak; // return stored value
-  } catch { return 0; }
-}
-function updateStreak(uid) {
-  const key = 'trv_streak_'+uid;
-  try {
-    const d = JSON.parse(localStorage.getItem(key)||'{"streak":0,"lastDate":""}');
-    const today = new Date().toDateString();
-    if (d.lastDate===today) return;
-    const yesterday = new Date(Date.now()-86400000).toDateString();
-    const newStreak = d.lastDate===yesterday ? d.streak+1 : 1;
-    localStorage.setItem(key,JSON.stringify({streak:newStreak,lastDate:today}));
-  } catch {}
-}
-
 function renderCourseList() {
-  const uid=S.session.id; const p=DB.prog(uid);
+  const uid=S.session.id; const p=currentProg();
   return `<div class="fade">
     <h1 class="page-title">My Courses</h1>
     <p class="page-sub">Click a course to start or continue learning.</p>
     <div class="course-grid">
       ${COURSES.map(c=>{
         const pct=calcCourseProg(uid,c.id);const sc=p[c.id]?.quizScore;const allW=pct===100;
-        const passed = sc!=null && sc>=SETTINGS.passThreshold;
+        const passed=sc!=null&&sc>=SETTINGS.passThreshold;
         return `<div class="course-card" data-cid="${c.id}">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
             <span class="badge ${c.catClass}">${esc(c.cat)}</span>
@@ -585,25 +852,19 @@ function renderCourseList() {
 function renderCoursePlayer() {
   const c=S.activeCourse; const uid=S.session.id;
   const m=S.activeModule||c.modules[0];
-  const p=DB.prog(uid); const pct=calcCourseProg(uid,c.id);
+  const p=currentProg(); const pct=calcCourseProg(uid,c.id);
   const allW=pct===100; const sc=p[c.id]?.quizScore;
   const watched=(p[c.id]?.watched||[]);
   const isWatched=watched.includes(m.id);
-  const videoComplete=S.videoWatched[m.id]||isWatched;
 
-  // Determine which content sources exist for this module
-  const hasVideo = !!S._videoUrl;
   const hasPdf   = !!S._pdfUrl;
   const hasYt    = !!S._ytId;
   const sources = [];
-  if (hasVideo) sources.push({key:'video',   label:'🎬 Video'});
-  if (hasYt)    sources.push({key:'youtube', label:'▶ YouTube'});
-  if (hasPdf)   sources.push({key:'pdf',     label:'📄 PDF'});
-  // active tab (fall back to first available)
+  if (hasYt)  sources.push({key:'youtube', label:'▶ YouTube'});
+  if (hasPdf) sources.push({key:'pdf',     label:'📄 PDF'});
   let activeTab = S._contentTab;
   if (!activeTab || !sources.find(s=>s.key===activeTab)) activeTab = sources[0]?.key || null;
 
-  // Content tabs (only if more than one source)
   let tabsBlock = '';
   if (sources.length > 1) {
     tabsBlock = `<div style="display:flex;gap:6px;margin-bottom:10px">
@@ -621,12 +882,6 @@ function renderCoursePlayer() {
         <p style="color:rgba(255,255,255,0.35);font-size:11px;margin-top:4px">No content uploaded yet</p>
       </div>
     </div>`;
-  } else if (activeTab==='video') {
-    mediaBlock += `<div class="video-wrapper">
-      <video id="course-video" src="${S._videoUrl}" controls controlsList="nodownload nofullscreen" disablePictureInPicture
-        style="width:100%;height:100%"></video>
-      <div class="video-progress-bar"><div class="video-progress-fill" id="vpf" style="width:0%"></div></div>
-    </div>`;
   } else if (activeTab==='pdf') {
     mediaBlock += `<div class="pdf-wrapper">
       <iframe src="${S._pdfUrl}" title="${esc(m.title)}"></iframe>
@@ -637,24 +892,13 @@ function renderCoursePlayer() {
   } else if (activeTab==='youtube') {
     const isFileProtocol = location.protocol === 'file:';
     if (isFileProtocol) {
-      // YouTube blocks ALL embedding from file:// — show a clear explanation
-      // instead of letting YouTube render its own broken Error 153 screen.
       mediaBlock += `<div class="video-wrapper" style="background:#0f0f0f;display:flex;align-items:center;justify-content:center">
         <div style="text-align:center;padding:32px;max-width:380px">
           <div style="font-size:44px;margin-bottom:14px">🌐</div>
           <p style="color:#fff;font-weight:700;font-size:15px;margin-bottom:10px">YouTube requires a web server</p>
-          <p style="color:rgba(255,255,255,0.55);font-size:12px;line-height:1.6;margin-bottom:20px">
-            You're opening this app directly as a file (<code style="background:rgba(255,255,255,0.1);padding:1px 5px;border-radius:3px">file://</code>).
-            YouTube blocks all embedded video playback on file:// pages — this is a YouTube restriction, not a bug.<br><br>
-            <strong style="color:rgba(255,255,255,0.8)">Fix:</strong> serve the app over HTTP, for example:<br>
-            <code style="display:inline-block;margin-top:8px;background:rgba(255,255,255,0.1);padding:4px 10px;border-radius:4px;font-size:11px">npx serve .</code>
-            &nbsp;or&nbsp;
-            <code style="background:rgba(255,255,255,0.1);padding:4px 10px;border-radius:4px;font-size:11px">python -m http.server</code>
-          </p>
-          <a href="https://www.youtube.com/watch?v=${esc(S._ytId)}"
-             target="_blank" rel="noopener noreferrer"
-             style="display:inline-block;padding:9px 20px;background:#FF0000;color:#fff;
-                    border-radius:6px;font-size:13px;font-weight:600;text-decoration:none">
+          <p style="color:rgba(255,255,255,0.55);font-size:12px;line-height:1.6;margin-bottom:20px">Serve the app over HTTP (e.g. <code>npx serve .</code>) to enable embedded YouTube videos.</p>
+          <a href="https://www.youtube.com/watch?v=${esc(S._ytId)}" target="_blank" rel="noopener noreferrer"
+             style="display:inline-block;padding:9px 20px;background:#FF0000;color:#fff;border-radius:6px;font-size:13px;font-weight:600;text-decoration:none">
             Watch on YouTube instead ↗
           </a>
         </div>
@@ -671,6 +915,7 @@ function renderCoursePlayer() {
       </div>`;
     }
   }
+
   return `<div class="fade">
     <div style="display:flex;align-items:center;gap:12px;margin-bottom:22px">
       <button class="btn-ghost btn-sm" id="back-btn">← Back</button>
@@ -690,20 +935,17 @@ function renderCoursePlayer() {
         <div class="card" style="margin-bottom:12px">
           <p style="font-family:'Syne',sans-serif;font-weight:700;font-size:17px;margin-bottom:4px">${esc(m.title)}</p>
           <p style="font-size:13px;color:var(--muted);margin-bottom:14px">${esc(m.description||m.dur)}</p>
-          ${(() => {
-            const modHasQuiz = m.quiz && m.quiz.length>0;
-            const modQuizScore = getModuleQuizScore(uid, c.id, m.id);
-            const modQuizPassed = modQuizScore!=null && modQuizScore>=SETTINGS.passThreshold;
-            const moduleComplete = isModuleComplete(uid, c.id, m.id);
-            // Step 1: watch/read the content
+          ${(()=>{
+            const modHasQuiz=m.quiz&&m.quiz.length>0;
+            const modQuizScore=getModuleQuizScore(uid,c.id,m.id,p);
+            const modQuizPassed=modQuizScore!=null&&modQuizScore>=SETTINGS.passThreshold;
+            const moduleComplete=isModuleComplete(uid,c.id,m.id,p);
             if (!isWatched) {
-              // If a video or YouTube exists, require full watch (enforced by player). Otherwise allow manual mark.
-              if ((hasVideo && activeTab==='video') || (hasYt && activeTab==='youtube')) {
+              if (hasYt && activeTab==='youtube') {
                 return `<div id="video-status-msg" style="font-size:12px;color:var(--muted)">⏳ Watch the full video to continue${hasPdf?' (or switch tabs and mark complete after reviewing the PDF)':''}</div>`;
               }
               return `<button class="btn-primary btn-sm" id="mark-btn" data-cid="${c.id}" data-mid="${m.id}" style="width:auto">Mark as complete</button>`;
             }
-            // Step 2: content watched — show quiz status / button
             if (!modHasQuiz) {
               return `<span class="badge badge-green" style="font-size:12px;padding:5px 14px">✓ Module complete</span>`;
             }
@@ -713,7 +955,6 @@ function renderCoursePlayer() {
                 <button class="btn-ghost btn-sm start-quiz-btn" data-cid="${c.id}" data-mid="${m.id}">Retake module quiz</button>
               </div>`;
             }
-            // Watched but quiz not passed (or not taken yet)
             return `<div style="background:#FFF3E0;border:1px solid #FFD9A8;border-radius:var(--r);padding:14px">
               <p style="font-weight:600;font-size:13px;margin-bottom:4px">📝 Module quiz required</p>
               <p style="font-size:12px;color:var(--muted);margin-bottom:12px">${modQuizScore!=null?`Last score: ${modQuizScore}% — you need ${SETTINGS.passThreshold}% to unlock the next module.`:`Pass this quiz (${SETTINGS.passThreshold}%) to unlock the next module.`}</p>
@@ -723,31 +964,31 @@ function renderCoursePlayer() {
             </div>`;
           })()}
         </div>
-        ${allW ? `<div class="card" style="background:#EAFAF4;border-color:#9FE1CB">
+        ${allW?`<div class="card" style="background:#EAFAF4;border-color:#9FE1CB">
           <p style="font-weight:600;color:var(--success);margin-bottom:6px">🎉 ${sc!=null?'Final quiz taken!':'All modules complete!'}</p>
           <p style="font-size:13px;color:#085041;margin-bottom:12px">${sc!=null?`Your final quiz score: <strong>${sc}%</strong>. Retake anytime.`:'You\'ve passed every module — take the final quiz to complete the course.'}</p>
           <button class="btn-primary btn-sm start-quiz-btn" data-cid="${c.id}" style="width:auto;background:var(--success)">
             ${sc!=null?'Retake final quiz':'Start final quiz →'}
           </button>
-        </div>` : (c.quiz && c.quiz.length ? `<div class="card" style="background:rgba(10,10,15,0.03)">
+        </div>`:(c.quiz&&c.quiz.length?`<div class="card" style="background:rgba(10,10,15,0.03)">
           <p style="font-weight:600;font-size:13px;color:var(--muted)">🔒 Final course quiz locked</p>
           <p style="font-size:12px;color:var(--muted);margin-top:4px">Complete all modules (watch + pass each module quiz) to unlock the final quiz.</p>
-        </div>` : '')}
+        </div>`:'')}
       </div>
       <div class="card" style="padding:16px">
         <p style="font-family:'Syne',sans-serif;font-weight:700;font-size:13px;margin-bottom:12px">Modules</p>
         ${c.modules.map((mod,i)=>{
-          const complete=isModuleComplete(uid, c.id, mod.id);
-          const unlocked=isModuleUnlocked(uid, c.id, i);
+          const complete=isModuleComplete(uid,c.id,mod.id,p);
+          const unlocked=isModuleUnlocked(uid,c.id,i,p);
           const isActive=S.activeModule?.id===mod.id;
           const numBg=complete?'var(--success)':unlocked?'rgba(10,10,15,0.06)':'rgba(10,10,15,0.03)';
           const numColor=complete?'#fff':'var(--muted)';
-          const modHasQuiz = mod.quiz && mod.quiz.length>0;
+          const modHasQuiz=mod.quiz&&mod.quiz.length>0;
           return `<div class="mod-item${isActive?' active':''}${unlocked?'':' locked-mod'}" data-mid="${mod.id}" data-unlocked="${unlocked}" style="${unlocked?'':'opacity:0.5;cursor:not-allowed'}">
             <div class="mod-num" style="background:${numBg};color:${numColor}">${complete?'✓':unlocked?i+1:'🔒'}</div>
             <div>
               <p style="font-size:13px;font-weight:500">${esc(mod.title)}</p>
-              <p style="font-size:11px;color:var(--muted)">${mod.dur}${[mod.video?'🎬':'',mod.ytId?'▶':'',mod.pdf?'📄':''].filter(Boolean).length?' · '+[mod.video?'🎬':'',mod.ytId?'▶':'',mod.pdf?'📄':''].filter(Boolean).join(' '):''}${modHasQuiz?' · 📝':''}</p>
+              <p style="font-size:11px;color:var(--muted)">${mod.dur}${[mod.ytId?'▶':'',mod.pdf?'📄':''].filter(Boolean).length?' · '+[mod.ytId?'▶':'',mod.pdf?'📄':''].filter(Boolean).join(' '):''}${modHasQuiz?' · 📝':''}</p>
             </div>
           </div>`;
         }).join('')}
@@ -756,172 +997,31 @@ function renderCoursePlayer() {
   </div>`;
 }
 
-function getRetakeCount(uid, cid) {
-  try { return parseInt(localStorage.getItem('trv_retakes_'+uid+'_'+cid)||'0'); } catch { return 0; }
-}
-function incrementRetakeCount(uid, cid) {
-  const n = getRetakeCount(uid, cid) + 1;
-  localStorage.setItem('trv_retakes_'+uid+'_'+cid, n);
-  return n;
-}
-
-function getQuizDef(cid, mid) {
-  const c = COURSES.find(x=>x.id===cid);
-  if (!c) return null;
-  if (mid) { const m = c.modules.find(x=>x.id===mid); return m ? (m.quiz||[]) : []; }
-  return c.quiz || [];
-}
-// Unique key for retake counting & answer storage (course quiz vs module quiz)
-function quizKey(cid, mid) { return mid ? cid+'_mod_'+mid : cid; }
-
-function saveQuizResult(cid, mid, score, answers) {
-  const p = DB.prog(S.session.id);
-  if (!p[cid]) p[cid] = {watched:[], quizScore:null, moduleQuiz:{}};
-  if (!p[cid].moduleQuiz) p[cid].moduleQuiz = {};
-  if (mid) {
-    p[cid].moduleQuiz[mid] = score;
-  } else {
-    p[cid].quizScore = score;
-  }
-  DB.saveProg(S.session.id, p);
-  localStorage.setItem('trv_qa_'+S.session.id+'_'+quizKey(cid,mid), JSON.stringify(answers));
-  updateStreak(S.session.id);
-}
-
-function renderQuiz() {
-  const c=COURSES.find(x=>x.id===S.quiz.cid);
-  const mid=S.quiz.mid||null;
-  const quizArr=getQuizDef(S.quiz.cid, mid);
-  const isModuleQuiz=!!mid;
-  const modObj=isModuleQuiz?c.modules.find(m=>m.id===mid):null;
-  const quizTitle=isModuleQuiz?`${c.title} — ${modObj?modObj.title:'Module'}`:`${c.title} — Final Quiz`;
-  const pass=SETTINGS.passThreshold;
-  const maxRetakes=SETTINGS.maxRetakes; // 0 = unlimited
-  const rkey=quizKey(S.quiz.cid, mid);
-
-  if (S.quiz.done) {
-    const passed=S.quiz.score>=pass;
-    const retakesDone=getRetakeCount(S.session.id,rkey);
-    const retakesLeft=maxRetakes===0?Infinity:Math.max(0,maxRetakes-retakesDone);
-    const canRetry=!passed&&retakesLeft>0;
-    const retakesMsg=maxRetakes===0?'Unlimited retakes allowed'
-      :retakesDone>=maxRetakes?'No retakes remaining'
-      :`${retakesLeft} retake${retakesLeft!==1?'s':''} remaining`;
-    return `<div class="fade" style="max-width:500px;margin:0 auto">
-      <div class="card pop" style="text-align:center;padding:48px 32px">
-        <div style="font-size:56px;margin-bottom:16px">${passed?'🏆':retakesLeft>0?'📚':'❌'}</div>
-        <h2 style="font-family:'Syne',sans-serif;font-weight:800;font-size:28px;margin-bottom:8px">
-          ${passed?'Well done!':retakesLeft>0?'Keep going!':'No retakes left'}
-        </h2>
-        <p style="font-size:13px;color:var(--muted);margin-bottom:6px">${esc(quizTitle)}</p>
-        <p style="font-size:15px;color:var(--muted);margin-bottom:6px">You scored</p>
-        <p style="font-family:'Syne',sans-serif;font-weight:800;font-size:48px;color:${passed?'var(--success)':'var(--accent)'};margin-bottom:6px">${S.quiz.score}%</p>
-        <p style="font-size:13px;color:var(--muted);margin-bottom:8px">${S.quiz.answers.reduce((a,ans,i)=>a+(ans===quizArr[i].ans?1:0),0)} of ${quizArr.length} correct</p>
-        <p style="font-size:12px;color:var(--muted);margin-bottom:24px">Pass mark: <strong>${pass}%</strong></p>
-        ${passed&&isModuleQuiz?`<div style="background:#EAFAF4;border-radius:var(--r);padding:14px;margin-bottom:24px">
-          <p style="font-size:13px;color:var(--success);font-weight:600">✓ Module passed — next module unlocked!</p>
-        </div>`:''}
-        ${passed&&!isModuleQuiz?`<div style="background:#EAFAF4;border-radius:var(--r);padding:14px;margin-bottom:24px">
-          <p style="font-size:13px;color:var(--success);font-weight:600">🎓 Course complete — certificate earned!</p>
-          <p style="font-size:12px;color:#085041;margin-top:4px">View it in My Certificates</p>
-        </div>`:''}
-        ${!passed&&!canRetry?`<div style="background:#FEF2F2;border:1px solid #F09595;border-radius:var(--r);padding:14px;margin-bottom:24px">
-          <p style="font-size:13px;color:var(--danger);font-weight:600">Retake limit reached</p>
-          <p style="font-size:12px;color:#791F1F;margin-top:4px">Contact your administrator to reset your quiz attempts.</p>
-        </div>`:''}
-        ${!passed&&canRetry?`<p style="font-size:13px;color:var(--muted);margin-bottom:24px">
-          You need <strong>${pass}%</strong> to ${isModuleQuiz?'unlock the next module':'pass'}. ${retakesMsg}.
-        </p>`:''}
-        <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap">
-          <button class="btn-primary" style="width:auto;padding:11px 26px" id="quiz-back-btn">Back to course</button>
-          ${canRetry?`<button class="btn-ghost" id="quiz-retry-btn">Retry quiz</button>`:''}
-          ${passed&&!isModuleQuiz?`<button class="btn-ghost" onclick="S.tab='certs';buildSidebar();S.quiz=null;render()">View certificate</button>`:''}
-        </div>
-        ${!passed&&maxRetakes>0?`<p style="font-size:11px;color:var(--muted);margin-top:16px">${retakesMsg}</p>`:''}
-      </div>
-      ${S.quiz.reviewMode?`<div class="card" style="margin-top:16px">
-        <p style="font-family:'Syne',sans-serif;font-weight:700;margin-bottom:14px">Review answers</p>
-        ${quizArr.map((q,i)=>{
-          const userAns=S.quiz.answers[i]; const correct=q.ans===userAns;
-          return `<div style="margin-bottom:18px;padding-bottom:18px;border-bottom:1px solid var(--border)">
-            <p style="font-size:13px;font-weight:600;margin-bottom:8px">${i+1}. ${esc(q.q)}</p>
-            ${q.opts.map((o,oi)=>`<div style="padding:8px 12px;border-radius:8px;font-size:12px;margin-bottom:4px;
-              background:${oi===q.ans?'#EAFAF4':oi===userAns&&!correct?'#FEF2F2':'transparent'};
-              border:1px solid ${oi===q.ans?'#9FE1CB':oi===userAns&&!correct?'#F09595':'var(--border)'}">
-              ${oi===q.ans?'✓ ':''}${oi===userAns&&!correct?'✗ ':''}<span style="color:var(--muted)">${String.fromCharCode(65+oi)}.</span> ${esc(o)}
-            </div>`).join('')}
-          </div>`;
-        }).join('')}
-      </div>`:
-      `<div style="text-align:center;margin-top:12px">
-        <button class="btn-ghost btn-sm" onclick="S.quiz.reviewMode=true;render()">Review answers</button>
-      </div>`}
-    </div>`;
-  }
-  const q=quizArr[S.quiz.step];
-  const retakesDone=getRetakeCount(S.session.id,rkey);
-  const retakesLeft=maxRetakes===0?null:Math.max(0,maxRetakes-retakesDone);
-  return `<div class="fade" style="max-width:560px">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px">
-      <div>
-        <h1 style="font-family:'Syne',sans-serif;font-weight:800;font-size:20px">${esc(quizTitle)}</h1>
-        <p style="font-size:13px;color:var(--muted)">Question ${S.quiz.step+1} of ${quizArr.length} · ${isModuleQuiz?'Module quiz':'Final course quiz'}</p>
-      </div>
-      <div style="text-align:right">
-        <button class="btn-ghost btn-sm" id="quiz-exit-btn">Exit</button>
-        <p style="font-size:11px;color:var(--muted);margin-top:4px">Pass: ${pass}%${maxRetakes===0?'':` · ${retakesLeft} retake${retakesLeft!==1?'s':''} left`}</p>
-      </div>
-    </div>
-    <div class="prog-bg" style="margin-bottom:24px">
-      <div class="prog-fill" style="width:${S.quiz.step/quizArr.length*100}%;background:var(--accent)"></div>
-    </div>
-    <div class="card" style="padding:28px">
-      <p style="font-family:'Syne',sans-serif;font-weight:700;font-size:18px;margin-bottom:22px;line-height:1.45">${esc(q.q)}</p>
-      ${q.opts.map((o,i)=>`<div class="quiz-opt" data-oi="${i}">
-        <span style="font-weight:600;color:var(--accent);margin-right:8px">${String.fromCharCode(65+i)}.</span>${esc(o)}
-      </div>`).join('')}
-    </div>
-  </div>`;
-}
-
 function renderProgress() {
-  const uid=S.session.id; const p=DB.prog(uid);
-  const overall=calcOverall(uid);
+  const uid=S.session.id; const p=currentProg();
   return `<div class="fade">
     <h1 class="page-title">My Progress</h1>
-    <p class="page-sub">Detailed view of every course and module.</p>
-    <div class="card" style="margin-bottom:20px;background:var(--ink);border-color:var(--ink)">
-      <div style="display:flex;align-items:center;justify-content:space-between">
-        <div>
-          <p style="font-family:'Syne',sans-serif;font-weight:800;font-size:36px;color:#F5F3EE">${overall}%</p>
-          <p style="font-size:13px;color:rgba(245,243,238,0.5)">Overall completion across all courses</p>
-        </div>
-        <div style="text-align:right">
-          <p style="font-family:'Syne',sans-serif;font-weight:800;font-size:24px;color:var(--gold)">${COURSES.filter(c=>isCoursePassed(uid,c.id)).length}</p>
-          <p style="font-size:12px;color:rgba(245,243,238,0.4)">Courses passed</p>
-        </div>
-      </div>
-      <div class="prog-bg" style="margin-top:16px;height:8px"><div class="prog-fill" style="width:${overall}%;background:var(--accent);height:8px;border-radius:4px"></div></div>
-    </div>
+    <p class="page-sub">Detailed breakdown across all courses.</p>
     ${COURSES.map(c=>{
       const pct=calcCourseProg(uid,c.id);const sc=p[c.id]?.quizScore;const wl=p[c.id]?.watched||[];
-      return `<div class="card" style="margin-bottom:14px">
-        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px">
-          <div>
-            <p style="font-family:'Syne',sans-serif;font-weight:700;font-size:16px">${esc(c.title)}</p>
-            <p style="font-size:12px;color:var(--muted)">${wl.length}/${c.modules.length} modules completed · ${sc!=null?`Quiz: ${sc}%`:'Quiz pending'}</p>
-          </div>
-          <div style="display:flex;gap:7px">
-            ${sc!=null?`<span class="badge ${sc>=SETTINGS.passThreshold?'badge-green':'badge-orange'}">${sc>=SETTINGS.passThreshold?'Passed':'Failed'}: ${sc}%</span>`
-              :`<span class="badge badge-red">Quiz pending</span>`}
-          </div>
+      const passed=sc!=null&&sc>=SETTINGS.passThreshold;
+      return `<div class="card" style="margin-bottom:16px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+          <p style="font-family:'Syne',sans-serif;font-weight:700;font-size:16px">${esc(c.title)}</p>
+          <span class="badge ${c.catClass}">${esc(c.cat)}</span>
         </div>
-        <div class="prog-bg" style="margin-bottom:12px"><div class="prog-fill" style="width:${pct}%;background:var(--accent)"></div></div>
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">
+          <span style="font-size:11px;color:var(--muted);width:90px">Content viewed</span>
+          <div class="prog-bg" style="flex:1"><div class="prog-fill" style="width:${pct}%;background:var(--accent)"></div></div>
+          <span style="font-size:12px;font-weight:600;width:42px;text-align:right">${pct}%</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
+          <span style="font-size:11px;color:var(--muted);width:90px">Quiz score</span>
+          <div class="prog-bg" style="flex:1"><div class="prog-fill" style="width:${sc!=null?sc:0}%;background:${passed?'var(--success)':sc!=null?'var(--gold)':'rgba(10,10,15,0.1)'}"></div></div>
+          <span style="font-size:12px;font-weight:600;width:42px;text-align:right;color:${sc!=null?(passed?'var(--success)':'var(--gold)'):'var(--muted)'}">${sc!=null?sc+'%':'—'}</span>
+        </div>
         <div style="display:flex;flex-wrap:wrap;gap:6px">
-          ${c.modules.map(mod=>{
-            const d=wl.includes(mod.id);
-            return `<span style="font-size:11px;padding:3px 11px;border-radius:100px;background:${d?'#EAFAF4':'rgba(10,10,15,0.05)'};color:${d?'var(--success)':'var(--muted)'}">${d?'✓ ':'○ '}${esc(mod.title)}</span>`;
-          }).join('')}
+          ${c.modules.map(mod=>{const d=wl.includes(mod.id);return`<span style="font-size:11px;padding:3px 11px;border-radius:100px;background:${d?'#EAFAF4':'rgba(10,10,15,0.05)'};color:${d?'var(--success)':'var(--muted)'}">${d?'✓ ':'○ '}${esc(mod.title)}</span>`;}).join('')}
         </div>
       </div>`;
     }).join('')}
@@ -929,14 +1029,14 @@ function renderProgress() {
 }
 
 function renderCertificates() {
-  const uid=S.session.id; const p=DB.prog(uid);
-  const passed=COURSES.filter(c=>isCoursePassed(uid,c.id));
+  const uid=S.session.id; const p=currentProg();
+  const passed=COURSES.filter(c=>isCoursePassed(uid,c.id,p));
   return `<div class="fade">
     <h1 class="page-title">My Certificates</h1>
     <p class="page-sub">Certificates earned by passing courses with ≥${SETTINGS.passThreshold}%.</p>
     ${passed.length===0
-      ? `<div class="empty"><div class="big-icon">🏆</div><p>No certificates yet. Complete a course and pass the quiz to earn one!</p></div>`
-      : `<div class="course-grid">${passed.map(c=>{
+      ?`<div class="empty"><div class="big-icon">🏆</div><p>No certificates yet. Complete a course and pass the quiz to earn one!</p></div>`
+      :`<div class="course-grid">${passed.map(c=>{
           const hasFinal=c.quiz&&c.quiz.length>0;
           const sc=hasFinal?p[c.id]?.quizScore:null;
           return `<div class="cert-wrapper">
@@ -951,6 +1051,76 @@ function renderCertificates() {
 }
 
 // ═══════════════════════════════════════════════════
+// QUIZ
+// ═══════════════════════════════════════════════════
+function getQuizDef(cid, mid) {
+  const c = COURSES.find(x=>x.id===cid);
+  if (!c) return null;
+  if (mid) { const m = c.modules.find(x=>x.id===mid); return m ? (m.quiz||[]) : []; }
+  return c.quiz || [];
+}
+
+async function saveQuizResult(cid, mid, score, answers) {
+  const uid = S.session.id;
+  const p   = currentProg();
+  if (!p[cid]) p[cid] = {watched:[], quizScore:null, moduleQuiz:{}};
+  if (!p[cid].moduleQuiz) p[cid].moduleQuiz = {};
+  if (mid) p[cid].moduleQuiz[mid] = score;
+  else p[cid].quizScore = score;
+  S._allProg[uid] = p;
+  // Persist to Supabase
+  await DB.saveProgCourse(uid, cid, p[cid]);
+  await DB.saveQuizAnswers(uid, quizKey(cid, mid), answers);
+  await updateStreak(uid);
+}
+
+function renderQuiz() {
+  const c=COURSES.find(x=>x.id===S.quiz.cid);
+  const mid=S.quiz.mid||null;
+  const quizArr=getQuizDef(S.quiz.cid, mid);
+  const isModuleQuiz=!!mid;
+  const modObj=isModuleQuiz?c.modules.find(m=>m.id===mid):null;
+  const quizTitle=isModuleQuiz?`${c.title} — ${modObj?modObj.title:'Module'}`:`${c.title} — Final Quiz`;
+  const pass=SETTINGS.passThreshold;
+  const maxRetakes=SETTINGS.maxRetakes;
+  const rcount=S._retakeCount||0;
+
+  if (S.quiz.done) {
+    const score=S.quiz.score;
+    const passed=score>=pass;
+    const canRetake=maxRetakes===0||rcount<maxRetakes;
+    return `<div class="fade" style="max-width:520px;margin:0 auto">
+      <div class="card" style="text-align:center;padding:36px">
+        <div style="font-size:52px;margin-bottom:16px">${passed?'🎉':'😔'}</div>
+        <h2 style="font-family:'Syne',sans-serif;font-weight:800;font-size:26px;margin-bottom:6px">${passed?'Quiz passed!':'Not quite'}</h2>
+        <p style="font-size:14px;color:var(--muted);margin-bottom:24px">You scored <strong style="font-size:28px;color:${passed?'var(--success)':'var(--danger)'}">${score}%</strong> on ${quizTitle}</p>
+        <p style="font-size:13px;color:var(--muted);margin-bottom:20px">Pass mark: ${pass}%${maxRetakes>0?` · Retakes used: ${rcount}/${maxRetakes}`:' · Unlimited retakes'}</p>
+        <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
+          ${canRetake&&!passed?`<button class="btn-primary" style="width:auto;padding:10px 24px" id="quiz-retry-btn">Try again</button>`:''}
+          <button class="btn-ghost" id="quiz-back-btn">Back to course</button>
+          ${passed?`<button class="btn-ghost" id="quiz-exit-btn">Go to dashboard</button>`:''}
+        </div>
+      </div>
+    </div>`;
+  }
+
+  const q=quizArr[S.quiz.step];
+  const total=quizArr.length;
+  return `<div class="fade" style="max-width:560px;margin:0 auto">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:22px">
+      <button class="btn-ghost btn-sm" id="quiz-exit-btn">✕ Exit quiz</button>
+      <span style="font-size:13px;color:var(--muted)">${quizTitle}</span>
+    </div>
+    <div class="prog-bg" style="margin-bottom:22px"><div class="prog-fill" style="width:${(S.quiz.step/total*100)}%;background:var(--accent)"></div></div>
+    <div class="card">
+      <p style="font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-bottom:12px">Question ${S.quiz.step+1} of ${total}</p>
+      <p style="font-family:'Syne',sans-serif;font-weight:700;font-size:18px;margin-bottom:20px">${esc(q.q)}</p>
+      ${q.opts.map((opt,oi)=>opt?`<div class="quiz-opt" data-oi="${oi}">${esc(opt)}</div>`:'').join('')}
+    </div>
+  </div>`;
+}
+
+// ═══════════════════════════════════════════════════
 // ADMIN VIEWS
 // ═══════════════════════════════════════════════════
 function renderAdmin() {
@@ -960,17 +1130,6 @@ function renderAdmin() {
   if (S.tab==='reports')  return renderReports();
   if (S.tab==='settings') return renderAdminSettings();
   return renderAdminDashboard();
-}
-
-function getAllStats() {
-  return DB.users().map(u=>{
-    const p=DB.prog(u.id);
-    const overall=calcOverall(u.id);
-    const qDone=COURSES.filter(c=>p[c.id]?.quizScore!=null).length;
-    const passed=COURSES.filter(c=>isCoursePassed(u.id,c.id)).length;
-    const avgQ=COURSES.length?Math.round(COURSES.filter(c=>p[c.id]?.quizScore!=null).reduce((a,c)=>a+(p[c.id]?.quizScore||0),0)/Math.max(1,COURSES.filter(c=>p[c.id]?.quizScore!=null).length)):0;
-    return {...u,overall,qDone,passed,avgQ,p};
-  });
 }
 
 function renderAdminDashboard() {
@@ -1186,15 +1345,12 @@ function renderReports() {
             const passCount=stats.filter(u=>u.p[c.id]?.quizScore>=SETTINGS.passThreshold).length;
             const avgQ=stats.filter(u=>u.p[c.id]?.quizScore!=null).length
               ?Math.round(stats.filter(u=>u.p[c.id]?.quizScore!=null).reduce((a,u)=>a+(u.p[c.id]?.quizScore||0),0)/Math.max(1,stats.filter(u=>u.p[c.id]?.quizScore!=null).length)):0;
-            return `<tr>
-              <td><strong>${esc(c.title)}</strong></td>
-              <td>${c.modules.length}</td>
+            return `<tr><td><strong>${esc(c.title)}</strong></td><td>${c.modules.length}</td>
               <td><div style="display:flex;align-items:center;gap:8px">
                 <div class="prog-bg" style="width:80px"><div class="prog-fill" style="width:${avg}%;background:var(--gold)"></div></div>
                 ${avg}%
               </div></td>
-              <td>${passCount}/${stats.length}</td>
-              <td>${avgQ}%</td>
+              <td>${passCount}/${stats.length}</td><td>${avgQ}%</td>
             </tr>`;
           }).join('')}
         </tbody>
@@ -1221,83 +1377,58 @@ function renderReports() {
   </div>`;
 }
 
-// ═══════════════════════════════════════════════════
-// ADMIN SETTINGS VIEW
-// ═══════════════════════════════════════════════════
 function renderAdminSettings() {
   const stats=getAllStats();
+  const adminPin = sessionStorage.getItem('trv_admin_pin') || localStorage.getItem('trv_admin_pin') || '';
   return `<div class="fade">
     <h1 class="page-title">Settings</h1>
     <p class="page-sub">Configure quiz rules and manage learner quiz attempts.</p>
-
     <div class="card" style="max-width:520px;margin-bottom:20px">
       <p style="font-family:'Syne',sans-serif;font-weight:700;font-size:16px;margin-bottom:4px">Quiz Rules</p>
       <p style="font-size:13px;color:var(--muted);margin-bottom:20px">These settings apply to all courses platform-wide.</p>
-
       <div class="field">
         <label>Passing score (%)</label>
         <div style="display:flex;align-items:center;gap:12px">
-          <input type="number" id="st-pass" min="1" max="100" value="${SETTINGS.passThreshold}"
-            style="width:100px">
+          <input type="number" id="st-pass" min="1" max="100" value="${SETTINGS.passThreshold}" style="width:100px">
           <span style="font-size:12px;color:var(--muted)">Learners must score at least this % to pass (default: 80%)</span>
         </div>
       </div>
-
       <div class="field">
         <label>Maximum retakes per quiz</label>
         <div style="display:flex;align-items:center;gap:12px">
-          <input type="number" id="st-retakes" min="0" max="99" value="${SETTINGS.maxRetakes}"
-            style="width:100px">
+          <input type="number" id="st-retakes" min="0" max="99" value="${SETTINGS.maxRetakes}" style="width:100px">
           <span style="font-size:12px;color:var(--muted)">Set to 0 for unlimited retakes (default: 2)</span>
         </div>
       </div>
-
       <div id="st-msg"></div>
       <div style="display:flex;gap:10px;align-items:center;margin-top:8px">
         <button class="btn-primary" style="width:auto;padding:10px 24px" id="st-save-btn">Save settings</button>
         <button class="btn-ghost btn-sm" id="st-reset-btn">Reset to defaults</button>
       </div>
     </div>
-
     <div class="card" style="max-width:520px;margin-bottom:20px">
       <p style="font-family:'Syne',sans-serif;font-weight:700;font-size:16px;margin-bottom:4px">Admin Password Reset PIN</p>
       <p style="font-size:13px;color:var(--muted);margin-bottom:18px">Set a PIN that allows the admin account password to be reset from the login screen if forgotten. Keep this somewhere safe.</p>
       <div class="field">
         <label>Admin PIN</label>
         <div style="display:flex;gap:10px;align-items:center">
-          <input type="password" id="st-admin-pin" placeholder="Set a PIN (any length)"
-            style="max-width:200px" value="${localStorage.getItem('trv_admin_pin')||''}">
+          <input type="password" id="st-admin-pin" placeholder="Set a PIN (any length)" style="max-width:200px" value="${adminPin}">
           <button class="btn-primary" style="width:auto;padding:9px 20px" id="st-pin-save-btn">Save PIN</button>
         </div>
       </div>
       <div id="st-pin-msg"></div>
     </div>
-
     <div class="card">
       <p style="font-family:'Syne',sans-serif;font-weight:700;font-size:16px;margin-bottom:4px">Learner Quiz Attempts</p>
       <p style="font-size:13px;color:var(--muted);margin-bottom:18px">
-        View how many retakes each learner has used and reset their attempts if needed.
         Current limit: <strong>${SETTINGS.maxRetakes===0?'Unlimited':SETTINGS.maxRetakes+' retake'+(SETTINGS.maxRetakes!==1?'s':'')}</strong>.
       </p>
       ${stats.length?`<table class="data-table">
-        <thead>
-          <tr>
-            <th>Learner</th>
-            ${COURSES.map(c=>`<th>${esc(c.title.length>14?c.title.slice(0,14)+'…':c.title)}<br><span style="font-weight:400;font-size:10px">retakes used</span></th>`).join('')}
-            <th>Actions</th>
-          </tr>
-        </thead>
+        <thead><tr><th>Learner</th><th>Actions</th></tr></thead>
         <tbody>
           ${stats.map(u=>`<tr>
             <td><strong>${esc(u.name)}</strong></td>
-            ${COURSES.map(c=>{
-              const used=getRetakeCount(u.id,c.id);
-              const over=SETTINGS.maxRetakes>0&&used>=SETTINGS.maxRetakes;
-              return `<td><span class="badge ${over?'badge-red':used>0?'badge-orange':'badge-green'}">${used}${SETTINGS.maxRetakes>0?'/'+SETTINGS.maxRetakes:' used'}</span></td>`;
-            }).join('')}
-            <td>
-              <button class="btn-ghost btn-sm reset-attempts-btn" data-uid="${u.id}" title="Reset all quiz attempt counters for this learner">Reset all</button>
-            </td>
+            <td><button class="btn-ghost btn-sm reset-attempts-btn" data-uid="${u.id}">Reset all quiz attempts</button></td>
           </tr>`).join('')}
         </tbody>
       </table>`:`<div class="empty"><div class="big-icon">👥</div><p>No learners registered yet.</p></div>`}
@@ -1330,7 +1461,7 @@ function openAddLearnerModal() {
     <div class="field"><label>Subject (optional)</label><input type="text" id="ml-dept" placeholder="e.g. Science"></div>
     <div class="field"><label>Temporary password</label><input type="password" id="ml-pw" placeholder="Min 6 characters"></div>
     <div class="field">
-      <label>Security question <span style="font-size:10px;color:var(--muted)">(learner can use this to reset password)</span></label>
+      <label>Security question</label>
       <select id="ml-sq">
         <option value="">— Choose a question —</option>
         <option value="pet">What was the name of your first pet?</option>
@@ -1364,7 +1495,7 @@ function openAddCourseModal(existingCourse) {
     </div>
     <p style="font-family:'Syne',sans-serif;font-weight:700;font-size:14px;margin-bottom:12px;margin-top:8px">Modules</p>
     <div id="mc-modules">
-      ${(c?.modules||[{id:uid(),title:'',dur:'',description:'',video:false,pdf:false,url:'',quiz:[]}]).map((m,i)=>moduleRow(m,i)).join('')}
+      ${(c?.modules||[{id:uid(),title:'',dur:'',description:'',video:false,pdf:false,ytId:'',quiz:[]}]).map((m,i)=>moduleRow(m,i)).join('')}
     </div>
     <button class="btn-ghost btn-sm" id="add-mod-btn" style="margin-bottom:20px">+ Add module</button>
     <p style="font-family:'Syne',sans-serif;font-weight:700;font-size:14px;margin-bottom:4px;margin-top:8px">🏁 Final course quiz</p>
@@ -1392,36 +1523,23 @@ function moduleRow(m, i) {
     <div class="field"><label>Title</label><input type="text" class="mod-title" data-mod-id="${m.id}" value="${esc(m.title)}" placeholder="Module title"></div>
     <div class="field"><label>Duration</label><input type="text" class="mod-dur" data-mod-id="${m.id}" value="${esc(m.dur)}" placeholder="15 min"></div>
     <div class="field"><label>Description</label><input type="text" class="mod-desc" data-mod-id="${m.id}" value="${esc(m.description||'')}" placeholder="Brief description"></div>
-
     <div style="margin-top:6px;padding:12px;border:1px solid var(--border);border-radius:var(--r);background:#fff">
-      <p style="font-weight:600;font-size:12px;margin-bottom:4px">📎 Learning content <span style="color:var(--muted);font-weight:400">(add at least one — uploaded video, PDF, and/or YouTube video)</span></p>
-
-      <div class="field" style="margin-top:10px">
-        <label>🎬 Video (.mp4 / .webm) — optional</label>
-        <div class="drop-zone" id="dz-${m.id}-video" data-kind="video" data-mod-id="${m.id}">
-          <div style="font-size:22px">🎬</div>
-          <p class="dz-status" data-key="${m.id}_video">${m.video?'✅ Video uploaded — click or drop to replace':'Click or drop a video'}</p>
-          <input type="file" class="mod-file-input" data-key="${m.id}_video" accept=".mp4,.webm" style="display:none">
-        </div>
-      </div>
-
+      <p style="font-weight:600;font-size:12px;margin-bottom:8px">📎 Learning content</p>
       <div class="field">
-        <label>📄 PDF — optional</label>
+        <label>▶ YouTube video link — optional</label>
+        <input type="text" class="mod-yt" data-mod-id="${m.id}" value="${esc(m.ytId||'')}"
+          placeholder="https://www.youtube.com/watch?v=... or bare video ID">
+        ${m.ytId ? `<p style="font-size:11px;color:var(--success);margin-top:4px">✅ YouTube video linked (ID: ${esc(m.ytId)})</p>` : ''}
+      </div>
+      <div class="field" style="margin-bottom:0">
+        <label>📄 PDF — upload to Supabase storage</label>
         <div class="drop-zone" id="dz-${m.id}-pdf" data-kind="pdf" data-mod-id="${m.id}">
           <div style="font-size:22px">📄</div>
           <p class="dz-status" data-key="${m.id}_pdf">${m.pdf?'✅ PDF uploaded — click or drop to replace':'Click or drop a PDF'}</p>
           <input type="file" class="mod-file-input" data-key="${m.id}_pdf" accept=".pdf" style="display:none">
         </div>
       </div>
-
-      <div class="field" style="margin-bottom:0">
-        <label>▶ YouTube video link — optional</label>
-        <input type="text" class="mod-yt" data-mod-id="${m.id}" value="${esc(m.ytId||'')}"
-          placeholder="https://www.youtube.com/watch?v=... or youtu.be/... or bare video ID">
-        ${m.ytId ? `<p style="font-size:11px;color:var(--success);margin-top:4px">✅ YouTube video linked (ID: ${esc(m.ytId)})</p>` : ''}
-      </div>
     </div>
-
     <div style="margin-top:10px;padding-top:12px;border-top:1px dashed var(--border)">
       <p style="font-weight:600;font-size:12px;margin-bottom:8px;color:var(--accent)">📝 Module quiz <span style="color:var(--muted);font-weight:400">(learner must pass to unlock next module — leave empty for none)</span></p>
       <div class="mod-quiz-list" data-mod-id="${m.id}">
@@ -1465,7 +1583,6 @@ function quizRow(q, i) {
 }
 
 function bindModalEvents() {
-  // Add module
   document.getElementById('add-mod-btn')?.addEventListener('click',()=>{
     const count=document.querySelectorAll('#mc-modules .accordion-body[data-mod-id]').length;
     const m={id:uid(),title:'',dur:'',description:'',video:false,pdf:false,ytId:'',quiz:[]};
@@ -1473,7 +1590,6 @@ function bindModalEvents() {
     bindDropZones();
     bindRemoveBtns();
   });
-  // Add quiz question
   document.getElementById('add-q-btn')?.addEventListener('click',()=>{
     const count=document.querySelectorAll('#mc-quiz [data-q-idx]').length;
     const q={q:'',opts:['','','',''],ans:0};
@@ -1482,7 +1598,7 @@ function bindModalEvents() {
   });
   bindDropZones();
   bindRemoveBtns();
-  // Per-module quiz add/remove — delegated on modal root so it works for added modules
+
   const modalRoot=document.getElementById('modal-root');
   if(modalRoot && !modalRoot._mqBound){
     modalRoot._mqBound=true;
@@ -1499,7 +1615,6 @@ function bindModalEvents() {
       if(rmBtn){
         const modId=rmBtn.dataset.modId;
         rmBtn.closest('.mod-quiz-row').remove();
-        // renumber
         document.querySelectorAll('.mod-quiz-list[data-mod-id="'+modId+'"] .mod-quiz-row').forEach((r,idx)=>{
           r.dataset.mqIdx=idx;
           r.querySelector('span').textContent='Q'+(idx+1);
@@ -1508,74 +1623,68 @@ function bindModalEvents() {
       }
     });
   }
+
   // Save new learner
-  document.getElementById('ml-save-btn')?.addEventListener('click',()=>{
+  document.getElementById('ml-save-btn')?.addEventListener('click', async ()=>{
     const name=document.getElementById('ml-name').value.trim();
-    const email=document.getElementById('ml-email').value.trim();
+    const email=document.getElementById('ml-email').value.trim().toLowerCase();
     const dept=document.getElementById('ml-dept').value.trim();
     const pw=document.getElementById('ml-pw').value;
     const msg=document.getElementById('ml-msg');
     if(!name||!email||!pw){msg.innerHTML='<div class="msg-err">All fields required.</div>';return;}
     if(pw.length<6){msg.innerHTML='<div class="msg-err">Password must be 6+ characters.</div>';return;}
-    const users=DB.users();
-    if(users.find(u=>u.email===email)){msg.innerHTML='<div class="msg-err">Email already registered.</div>';return;}
-    const sq=document.getElementById('ml-sq')?.value||'';
-    const sa=(document.getElementById('ml-sa')?.value||'').trim().toLowerCase();
-    const nu={id:'u_'+Date.now(),name,email,pw,sq,sa,dept,notes:'',createdAt:new Date().toISOString(),disabled:false};
-    DB.saveUsers([...users,nu]);
-    closeModal();toast('Learner added successfully');render();
+    try {
+      const users=await DB.users();
+      if(users.find(u=>u.email===email)){msg.innerHTML='<div class="msg-err">Email already registered.</div>';return;}
+      const sq=document.getElementById('ml-sq')?.value||'';
+      const sa=(document.getElementById('ml-sa')?.value||'').trim().toLowerCase();
+      const nu={id:'u_'+Date.now(),name,email,pw,sq,sa,dept,notes:'',created_at:new Date().toISOString(),disabled:false};
+      await DB.saveUser(nu);
+      // update cache
+      S._allUsers = await DB.users();
+      closeModal();toast('Learner added successfully');render();
+    } catch(err) {
+      msg.innerHTML=`<div class="msg-err">Error: ${err.message}</div>`;
+    }
   });
+
   // Save course
-  document.getElementById('mc-save-btn')?.addEventListener('click',saveCourseFromModal);
+  document.getElementById('mc-save-btn')?.addEventListener('click', saveCourseFromModal);
 }
 
 function bindDropZones() {
   document.querySelectorAll('.drop-zone').forEach(dz=>{
     const inp=dz.querySelector('.mod-file-input');
     if(!inp)return;
-    const storeKey=inp.dataset.key;  // e.g. "<modId>_video" or "<modId>_pdf"
+    const storeKey=inp.dataset.key;
     dz.addEventListener('click',(e)=>{if(e.target!==inp){inp.click();}});
     dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('drag-over');});
     dz.addEventListener('dragleave',()=>dz.classList.remove('drag-over'));
     dz.addEventListener('drop',e=>{e.preventDefault();e.stopPropagation();dz.classList.remove('drag-over');handleFileUpload(e.dataTransfer.files[0],storeKey,dz);});
     inp.addEventListener('change',()=>handleFileUpload(inp.files[0],storeKey,dz));
-    // Async-check IDB for existing upload status
-    const pEl=dz.querySelector('.dz-status');
-    if(pEl&&pEl.dataset.key){
-      IDB.get(pEl.dataset.key).then(data=>{
-        if(data) pEl.textContent='✅ File already uploaded — click or drop to replace';
-      }).catch(()=>{});
-    }
   });
 }
 
+// Upload PDF to Supabase Storage bucket "pdfs"
 async function handleFileUpload(file, storeKey, dz) {
-  if(!file) return;
-  if(file.size > 500*1024*1024) {
-    toast('File is very large (>500MB). Consider compressing it first.','err');
-    return;
-  }
-  // Validate type against the drop zone kind
-  const kind = dz.dataset.kind; // 'video' or 'pdf'
+  if (!file) return;
+  const kind = dz.dataset.kind;
+  if (kind !== 'pdf') { toast('Only PDFs are supported for upload.','err'); return; }
   const isPdf = file.type==='application/pdf' || /\.pdf$/i.test(file.name);
-  const isVideo = /^video\//.test(file.type) || /\.(mp4|webm)$/i.test(file.name);
-  if (kind==='pdf' && !isPdf) { toast('That is not a PDF file.','err'); return; }
-  if (kind==='video' && !isVideo) { toast('That is not a video file (.mp4/.webm).','err'); return; }
+  if (!isPdf) { toast('That is not a PDF file.','err'); return; }
+  if (file.size > 50*1024*1024) { toast('PDF is too large (>50MB).','err'); return; }
 
   const pEl = dz.querySelector('p');
-  pEl.textContent = '⏳ Uploading…';
+  pEl.textContent = '⏳ Uploading to Supabase…';
+
+  // storeKey is "<modId>_pdf" — derive the module ID
+  const modId = storeKey.replace('_pdf','');
+
   try {
-    const data = await new Promise((res, rej) => {
-      const r = new FileReader();
-      r.onload  = e => res(e.target.result);
-      r.onerror = () => rej(new Error('Read failed'));
-      r.readAsDataURL(file);
-    });
-    await IDB.save(storeKey, data);
-    // Mark this drop zone as filled so the save routine knows
+    await SB.uploadFile('pdfs', modId + '.pdf', file, 'application/pdf');
     dz.dataset.uploaded = 'true';
     pEl.textContent = '✅ ' + file.name + ' uploaded';
-    toast('File uploaded successfully ✅');
+    toast('PDF uploaded to Supabase ✅');
   } catch(err) {
     pEl.textContent = 'Upload failed — try again';
     toast('Upload failed: ' + err.message, 'err');
@@ -1586,7 +1695,6 @@ function bindRemoveBtns() {
   document.querySelectorAll('.remove-mod-btn').forEach(btn=>{
     btn.addEventListener('click',()=>{
       document.getElementById('mod-row-'+btn.dataset.modId)?.remove();
-      // renumber
       document.querySelectorAll('#mc-modules .accordion-body').forEach((el,i)=>{
         el.querySelector('span').textContent='Module '+(i+1);
       });
@@ -1613,103 +1721,78 @@ async function saveCourseFromModal() {
     const catClassEl=document.getElementById('mc-catclass');
     const saveBtn=document.getElementById('mc-save-btn');
 
-    if(!titleEl||!catEl||!catClassEl||!saveBtn){
-      msg.innerHTML='<div class="msg-err">Form elements missing — please close and reopen the modal.</div>';
-      return;
-    }
-
     const title=titleEl.value.trim();
     const cat=catEl.value.trim();
     const catClass=catClassEl.value;
     const existingCid=saveBtn.dataset.cid.trim();
-
     const errors=[];
     if(!title) errors.push('Course title is required.');
     if(!cat)   errors.push('Category is required.');
 
-    // Look up existing course so we can preserve existing src values
-    const existingCourse=existingCid?COURSES.find(c=>c.id===existingCid):null;
-
-    // Collect modules — preserve src for modules that already have one
     const modEls=document.querySelectorAll('#mc-modules .accordion-body[data-mod-id]');
     const modules=[];
-    const modEntries=[];
     modEls.forEach(el=>{
       const mid=el.dataset.modId;
-      const titleInput=el.querySelector('.mod-title');
-      const durInput=el.querySelector('.mod-dur');
-      const descInput=el.querySelector('.mod-desc');
-      if(!titleInput){errors.push('A module row is missing its title field.');return;}
-      const t=titleInput.value.trim();
-      const d=durInput?.value.trim()||'';
-      const desc=descInput?.value.trim()||'';
+      const t=(el.querySelector('.mod-title')?.value||'').trim();
+      const d=(el.querySelector('.mod-dur')?.value||'').trim();
+      const desc=(el.querySelector('.mod-desc')?.value||'').trim();
       if(!t){errors.push('All modules must have a title.');return;}
-      modEntries.push({el, mid, t, d, desc});
-    });
 
-    // Async pass: gather content sources (video/pdf in IDB, ytId in DOM) per module
-    for (const {el, mid, t, d, desc} of modEntries) {
-      // YouTube field
-      const ytRaw = (el.querySelector('.mod-yt')?.value || '').trim();
-      const ytId  = parseYtId(ytRaw);
-      if (ytRaw && !ytId) {
-        errors.push(`Module "${t}": the YouTube link/ID doesn't look valid. Paste the full URL or the 11-character video ID.`);
+      const ytRaw=(el.querySelector('.mod-yt')?.value||'').trim();
+      const ytId=parseYtId(ytRaw);
+      if(ytRaw&&!ytId) errors.push(`Module "${t}": the YouTube link/ID doesn't look valid.`);
+
+      const hasPdfUploaded = el.querySelector('.drop-zone')?.dataset.uploaded === 'true';
+      // Also check if originally had PDF (edit mode)
+      const existingCourse = COURSES.find(c=>c.id===existingCid);
+      const existingMod = existingCourse?.modules.find(m=>m.id===mid);
+      const hasPdf = hasPdfUploaded || (existingMod?.pdf || false);
+
+      if (!ytId && !hasPdf) {
+        errors.push(`Module "${t}" needs at least one content source (YouTube video or PDF).`);
       }
-      // Video / PDF presence — check IDB for stored blobs
-      let hasVideo=false, hasPdf=false;
-      try { hasVideo = !!(await IDB.get(mid+'_video')); } catch {}
-      try { hasPdf   = !!(await IDB.get(mid+'_pdf'));   } catch {}
-      if (!hasVideo && !hasPdf && !ytId) {
-        errors.push(`Module "${t}" needs at least one content source (uploaded video, PDF, or YouTube video).`);
-      }
-      // Collect this module's quiz
+
       const modQuiz=[];
-      el.querySelectorAll('.mod-quiz-row').forEach((row,qi)=>{
+      el.querySelectorAll('.mod-quiz-row').forEach((row)=>{
         const qt=row.querySelector('.mq-text')?.value.trim()||'';
         const opts=Array.from(row.querySelectorAll('.mq-opt')).map(o=>o.value.trim());
         const ansR=row.querySelector('.mq-ans:checked');
         const ans=ansR?parseInt(ansR.dataset.oi):0;
-        if(qt && opts.filter(o=>o).length>=2){ modQuiz.push({q:qt,opts,ans}); }
-        else if(qt && opts.filter(o=>o).length<2){ errors.push(`Module "${t}": a quiz question needs at least 2 options.`); }
+        if(qt&&opts.filter(o=>o).length>=2){ modQuiz.push({q:qt,opts,ans}); }
+        else if(qt&&opts.filter(o=>o).length<2){ errors.push(`Module "${t}": a quiz question needs at least 2 options.`); }
       });
-      modules.push({
-        id:mid, title:t, dur:d||'—', description:desc, quiz:modQuiz,
-        video: hasVideo, pdf: hasPdf, ytId: ytId||''
-      });
-    }
 
-    if(!modules.length) errors.push('At least one module with a title is required.');
+      modules.push({id:mid,title:t,dur:d||'—',description:desc,quiz:modQuiz,
+        video:false, pdf:hasPdf, ytId:ytId||''});
+    });
 
-    // Collect final course quiz (optional)
+    if(!modules.length) errors.push('At least one module is required.');
+
     const qEls=document.querySelectorAll('#mc-quiz [data-q-idx]');
     const quiz=[];
-    qEls.forEach((el,i)=>{
-      const qTextEl=el.querySelector('.q-text');
-      if(!qTextEl) return;
-      const qText=qTextEl.value.trim();
+    qEls.forEach((el)=>{
+      const qText=el.querySelector('.q-text')?.value.trim();
       const opts=Array.from(el.querySelectorAll('.q-opt')).map(o=>o.value.trim());
       const ansRadio=el.querySelector('.q-ans-radio:checked');
       const ans=ansRadio?parseInt(ansRadio.dataset.oi):0;
-      if(!qText) return; // skip blank final-quiz rows (final quiz is optional)
-      if(opts.filter(o=>o).length<2){errors.push(`Final quiz question ${i+1} needs at least 2 options.`);return;}
+      if(!qText) return;
+      if(opts.filter(o=>o).length<2){errors.push(`Final quiz question needs at least 2 options.`);return;}
       quiz.push({q:qText,opts,ans});
     });
-    // Final quiz is optional now — no error if empty
 
     if(errors.length){
-      msg.innerHTML='<div class="msg-err"><strong>Please fix the following:</strong><ul style="margin:6px 0 0 16px">'
-        +errors.map(e=>`<li>${e}</li>`).join('')+'</ul></div>';
+      msg.innerHTML='<div class="msg-err"><strong>Please fix the following:</strong><ul style="margin:6px 0 0 16px">'+errors.map(e=>`<li>${e}</li>`).join('')+'</ul></div>';
       msg.scrollIntoView({behavior:'smooth',block:'nearest'});
       return;
     }
 
-    if(existingCid&&existingCourse){
-      const idx=COURSES.findIndex(c=>c.id===existingCid);
-      COURSES[idx]={...COURSES[idx],title,cat,catClass,modules,quiz};
-    } else {
-      COURSES.push({id:'c_'+Date.now(),title,cat,catClass,modules,quiz});
-    }
-    saveCourses();
+    const courseId = existingCid || 'c_'+Date.now();
+    const course = {id:courseId, title, cat, catClass, modules, quiz};
+    await DB.saveCourse(course);
+
+    // Refresh in-memory list
+    COURSES = await DB.courses();
+
     closeModal();
     toast(existingCid?'Course updated ✅':'Course created ✅');
     render();
@@ -1720,201 +1803,132 @@ async function saveCourseFromModal() {
   }
 }
 
+// ═══════════════════════════════════════════════════
+// STREAK HELPERS
+// ═══════════════════════════════════════════════════
+async function updateStreak(userId) {
+  try {
+    const today = new Date().toDateString();
+    const row   = await DB.getStreak(userId);
+    if (row.last_date === today) return;
+    const yesterday = new Date(Date.now()-86400000).toDateString();
+    const newStreak = row.last_date === yesterday ? (row.streak||0)+1 : 1;
+    await DB.saveStreak(userId, newStreak, today);
+    if (userId === S.session?.id) S._streak = newStreak;
+  } catch(e) { console.warn('streak update failed', e); }
+}
 
 // ═══════════════════════════════════════════════════
-// EXPORT FUNCTIONS
+// EXPORT HELPERS
 // ═══════════════════════════════════════════════════
-
 function exportLearnerReport(uid) {
   const stats = getAllStats();
-  const u = stats.find(x => x.id === uid);
+  const u = stats.find(x=>x.id===uid);
   if (!u) return;
-
   const now = new Date().toLocaleDateString('en-GB', {day:'2-digit',month:'long',year:'numeric'});
   const passThresh = SETTINGS.passThreshold;
-
-  // Build per-course rows
   let courseRows = '';
   COURSES.forEach(c => {
     const pct = calcCourseProg(u.id, c.id);
     const wl  = u.p[c.id]?.watched || [];
-    const coursePassed = isCoursePassed(u.id, c.id);
+    const coursePassed = isCoursePassed(u.id, c.id, u.p);
     const hasFinal = c.quiz && c.quiz.length>0;
     const finalSc = hasFinal ? u.p[c.id]?.quizScore : null;
     const statusColor = coursePassed ? '#1D9E75' : pct>0 ? '#E8A838' : '#E24B4A';
     const statusText  = coursePassed ? 'Completed' : pct>0 ? 'In progress' : 'Not started';
-
     let moduleRows = c.modules.map(mod => {
       const watchedMod = wl.includes(mod.id);
       const modHasQuiz = mod.quiz && mod.quiz.length>0;
       const mScore = u.p[c.id]?.moduleQuiz?.[mod.id] ?? null;
-      const modComplete = isModuleComplete(u.id, c.id, mod.id);
+      const modComplete = isModuleComplete(u.id, c.id, mod.id, u.p);
       let statusLabel;
       if (modComplete) statusLabel = '<span style="color:#1D9E75;font-weight:600">✓ Passed</span>';
       else if (watchedMod && modHasQuiz) statusLabel = `<span style="color:#E8A838;font-weight:600">Watched · quiz ${mScore!=null?mScore+'%':'pending'}</span>`;
       else if (watchedMod) statusLabel = '<span style="color:#1D9E75;font-weight:600">✓ Watched</span>';
       else statusLabel = '<span style="color:#aaa;font-weight:600">○ Not started</span>';
-      return `<tr>
-        <td style="padding:6px 12px;font-size:12px;color:#444">${esc(mod.title)}${modHasQuiz?' <span style=\"color:#999;font-size:10px\">(has quiz)</span>':''}</td>
-        <td style="padding:6px 12px;font-size:12px;text-align:center">${statusLabel}</td>
-      </tr>`;
+      return `<tr><td style="padding:6px 12px;font-size:12px;color:#444">${esc(mod.title)}</td><td style="padding:6px 12px;font-size:12px;text-align:center">${statusLabel}</td></tr>`;
     }).join('');
-
-    courseRows += `
-      <tr style="background:#F5F3EE">
-        <td colspan="2" style="padding:10px 12px">
-          <div style="display:flex;justify-content:space-between;align-items:center">
-            <strong style="font-size:13px">${esc(c.title)}</strong>
-            <div style="display:flex;gap:10px;align-items:center">
-              <span style="font-size:12px;color:#666">${pct}% complete${hasFinal?' · Final quiz: '+(finalSc!=null?finalSc+'%':'pending'):''}</span>
-              <span style="font-size:11px;font-weight:700;padding:3px 10px;border-radius:100px;background:${statusColor}20;color:${statusColor}">
-                ${statusText}
-              </span>
-            </div>
-          </div>
-        </td>
-      </tr>
-      ${moduleRows}
-      <tr><td colspan="2" style="padding:4px"></td></tr>`;
+    courseRows += `<tr style="background:#F5F3EE"><td colspan="2" style="padding:10px 12px">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <strong style="font-size:13px">${esc(c.title)}</strong>
+        <div style="display:flex;gap:10px;align-items:center">
+          <span style="font-size:12px;color:#666">${pct}% complete${hasFinal?' · Final quiz: '+(finalSc!=null?finalSc+'%':'pending'):''}</span>
+          <span style="font-size:11px;font-weight:700;padding:3px 10px;border-radius:100px;background:${statusColor}20;color:${statusColor}">${statusText}</span>
+        </div>
+      </div></td></tr>${moduleRows}<tr><td colspan="2" style="padding:4px"></td></tr>`;
   });
-
-  const html = `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<title>Learner Report — ${esc(u.name)}</title>
-<style>
-  body { font-family: 'Segoe UI', Arial, sans-serif; margin: 0; padding: 40px; color: #0A0A0F; background: #fff; }
-  .header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 32px; padding-bottom: 20px; border-bottom: 2px solid #FF4D00; }
-  .logo { font-size: 22px; font-weight: 900; color: #0A0A0F; letter-spacing: -1px; }
-  .logo span { color: #FF4D00; }
-  .meta { font-size: 12px; color: #888; text-align: right; }
-  h1 { font-size: 26px; font-weight: 800; margin: 0 0 4px; }
-  .sub { font-size: 13px; color: #888; margin-bottom: 28px; }
-  .stats { display: flex; gap: 16px; margin-bottom: 28px; }
-  .stat { flex: 1; border: 1px solid #eee; border-radius: 10px; padding: 14px 16px; }
-  .stat-val { font-size: 26px; font-weight: 900; color: #0A0A0F; }
-  .stat-lbl { font-size: 11px; color: #888; margin-top: 2px; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th { text-align: left; padding: 9px 12px; font-size: 11px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: #888; border-bottom: 1px solid #eee; }
-  .section-title { font-size: 15px; font-weight: 800; margin: 28px 0 12px; color: #0A0A0F; }
-  .footer { margin-top: 40px; padding-top: 16px; border-top: 1px solid #eee; font-size: 11px; color: #bbb; text-align: center; }
-  @media print { body { padding: 20px; } }
-</style>
-</head>
-<body>
-  <div class="header">
-    <div>
-      <div class="logo">Trivekii<span>.</span></div>
-      <h1>${esc(u.name)}</h1>
-      <div class="sub">${esc(u.email)}${u.dept ? ' · ' + esc(u.dept) : ''}</div>
-    </div>
-    <div class="meta">
-      <div>Learner Progress Report</div>
-      <div>Generated: ${now}</div>
-      <div>Pass mark: ${passThresh}%</div>
-    </div>
+  const html=`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Learner Report — ${esc(u.name)}</title>
+  <style>body{font-family:'Segoe UI',Arial,sans-serif;margin:0;padding:40px;color:#0A0A0F;background:#fff}.logo{font-size:22px;font-weight:900;color:#0A0A0F}.logo span{color:#FF4D00}h1{font-size:26px;font-weight:800;margin:0 0 4px}.stats{display:flex;gap:16px;margin-bottom:28px}.stat{flex:1;border:1px solid #eee;border-radius:10px;padding:14px 16px}.stat-val{font-size:26px;font-weight:900}.stat-lbl{font-size:11px;color:#888;margin-top:2px}table{width:100%;border-collapse:collapse;font-size:13px}th{text-align:left;padding:9px 12px;font-size:11px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:#888;border-bottom:1px solid #eee}.section-title{font-size:15px;font-weight:800;margin:28px 0 12px}.footer{margin-top:40px;padding-top:16px;border-top:1px solid #eee;font-size:11px;color:#bbb;text-align:center}</style>
+  </head><body>
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:32px;padding-bottom:20px;border-bottom:2px solid #FF4D00">
+    <div><div class="logo">Trivekii<span>.</span></div><h1>${esc(u.name)}</h1><div style="font-size:13px;color:#888">${esc(u.email)}${u.dept?' · '+esc(u.dept):''}</div></div>
+    <div style="font-size:12px;color:#888;text-align:right"><div>Learner Progress Report</div><div>Generated: ${now}</div><div>Pass mark: ${passThresh}%</div></div>
   </div>
-
   <div class="stats">
     <div class="stat"><div class="stat-val">${u.overall}%</div><div class="stat-lbl">Overall completion</div></div>
     <div class="stat"><div class="stat-val">${u.passed}/${COURSES.length}</div><div class="stat-lbl">Courses passed</div></div>
     <div class="stat"><div class="stat-val">${u.qDone}/${COURSES.length}</div><div class="stat-lbl">Quizzes attempted</div></div>
     <div class="stat"><div class="stat-val">${u.avgQ}%</div><div class="stat-lbl">Avg quiz score</div></div>
   </div>
-
   <div class="section-title">Course & Module Breakdown</div>
-  <table>
-    <thead><tr><th>Module</th><th style="text-align:center">Status</th></tr></thead>
-    <tbody>${courseRows}</tbody>
-  </table>
-
+  <table><thead><tr><th>Module</th><th style="text-align:center">Status</th></tr></thead><tbody>${courseRows}</tbody></table>
   <div class="footer">Trivekii LMS · Confidential · ${now}</div>
-</body>
-</html>`;
-
-  downloadFile(u.name.replace(/\s+/g,'_') + '_report.html', html, 'text/html');
+  </body></html>`;
+  downloadFile(u.name.replace(/\s+/g,'_')+'_report.html', html, 'text/html');
   toast('Report downloaded');
 }
 
-function exportQuizCSV(uid) {
+async function exportQuizCSV(uid) {
   const stats = getAllStats();
-  const u = stats.find(x => x.id === uid);
+  const u = stats.find(x=>x.id===uid);
   if (!u) return;
-
-  const rows = [];
-  rows.push(['Learner', 'Email', 'Course', 'Quiz', 'Question #', 'Question', 'Learner Answer', 'Correct Answer', 'Result', 'Quiz Score %']);
-
-  // Helper to emit rows for one quiz (module or final)
-  function emitQuiz(c, quizArr, quizLabel, score, storedAnswers) {
-    if (!quizArr || !quizArr.length) return;
-    quizArr.forEach((q, i) => {
-      if (score == null) {
-        rows.push([u.name, u.email, c.title, quizLabel, i+1, q.q, 'Not attempted', q.opts[q.ans], '—', '—']);
-      } else if (storedAnswers && storedAnswers.length) {
-        const ansIdx = storedAnswers[i] != null ? storedAnswers[i] : -1;
-        const learnerAns = ansIdx >= 0 ? q.opts[ansIdx] : 'No answer recorded';
-        const correct = ansIdx === q.ans;
-        rows.push([u.name, u.email, c.title, quizLabel, i+1, q.q, learnerAns, q.opts[q.ans], correct?'Correct':'Incorrect', score+'%']);
+  const rows=[['Learner','Email','Course','Quiz','Question #','Question','Learner Answer','Correct Answer','Result','Quiz Score %']];
+  async function emitQuiz(c, quizArr, quizLabel, score, qKey) {
+    if(!quizArr||!quizArr.length) return;
+    const storedAnswers = await DB.getQuizAnswers(uid, qKey);
+    quizArr.forEach((q,i)=>{
+      if(score==null){rows.push([u.name,u.email,c.title,quizLabel,i+1,q.q,'Not attempted',q.opts[q.ans],'—','—']);}
+      else if(storedAnswers&&storedAnswers.length){
+        const ansIdx=storedAnswers[i]!=null?storedAnswers[i]:-1;
+        const learnerAns=ansIdx>=0?q.opts[ansIdx]:'No answer recorded';
+        const correct=ansIdx===q.ans;
+        rows.push([u.name,u.email,c.title,quizLabel,i+1,q.q,learnerAns,q.opts[q.ans],correct?'Correct':'Incorrect',score+'%']);
       } else {
-        rows.push([u.name, u.email, c.title, quizLabel, i+1, q.q, '(answer detail not available)', q.opts[q.ans], '—', score+'%']);
+        rows.push([u.name,u.email,c.title,quizLabel,i+1,q.q,'(detail not available)',q.opts[q.ans],'—',score+'%']);
       }
     });
   }
-
-  COURSES.forEach(c => {
-    // Module quizzes
-    c.modules.forEach(mod => {
-      if (mod.quiz && mod.quiz.length) {
-        const mScore = u.p[c.id]?.moduleQuiz?.[mod.id] ?? null;
-        const mAns = getStoredQuizAnswers(uid, c.id+'_mod_'+mod.id);
-        emitQuiz(c, mod.quiz, 'Module: '+mod.title, mScore, mAns);
+  for(const c of COURSES){
+    for(const mod of c.modules){
+      if(mod.quiz&&mod.quiz.length){
+        const mScore=u.p[c.id]?.moduleQuiz?.[mod.id]??null;
+        await emitQuiz(c,mod.quiz,'Module: '+mod.title,mScore,quizKey(c.id,mod.id));
       }
-    });
-    // Final course quiz
-    if (c.quiz && c.quiz.length) {
-      const fScore = u.p[c.id]?.quizScore ?? null;
-      const fAns = getStoredQuizAnswers(uid, c.id);
-      emitQuiz(c, c.quiz, 'Final course quiz', fScore, fAns);
     }
-  });
-
-  const csv = rows.map(r => r.map(cell => {
-    const s = String(cell == null ? '' : cell).replace(/"/g, '""');
-    return /[,\n"]/.test(s) ? '"' + s + '"' : s;
-  }).join(',')).join('\n');
-
-  downloadFile(u.name.replace(/\s+/g,'_') + '_quiz_responses.csv', csv, 'text/csv');
+    if(c.quiz&&c.quiz.length){
+      const fScore=u.p[c.id]?.quizScore??null;
+      await emitQuiz(c,c.quiz,'Final course quiz',fScore,quizKey(c.id,null));
+    }
+  }
+  const csv=rows.map(r=>r.map(cell=>{const s=String(cell==null?'':cell).replace(/"/g,'""');return/[,\n"]/.test(s)?'"'+s+'"':s;}).join(',')).join('\n');
+  downloadFile(u.name.replace(/\s+/g,'_')+'_quiz_responses.csv',csv,'text/csv');
   toast('Quiz responses CSV downloaded');
 }
 
-function getStoredQuizAnswers(uid, cid) {
-  try { return JSON.parse(localStorage.getItem('trv_qa_' + uid + '_' + cid) || 'null'); } catch { return null; }
-}
-
 function downloadFile(filename, content, mimeType) {
-  // Use data URI so it works on file:// protocol (no blob URL needed)
-  const isText = mimeType.startsWith('text/');
-  const encoded = isText
-    ? 'data:' + mimeType + ';charset=utf-8,' + encodeURIComponent(content)
-    : 'data:' + mimeType + ';base64,' + btoa(unescape(encodeURIComponent(content)));
-  const a = document.createElement('a');
-  a.href = encoded;
-  a.download = filename;
-  a.style.display = 'none';
-  document.body.appendChild(a);
-  a.click();
-  setTimeout(() => document.body.removeChild(a), 200);
+  const encoded = 'data:'+mimeType+';charset=utf-8,'+encodeURIComponent(content);
+  const a=document.createElement('a');
+  a.href=encoded; a.download=filename; a.style.display='none';
+  document.body.appendChild(a); a.click();
+  setTimeout(()=>document.body.removeChild(a),200);
 }
 
 // ═══════════════════════════════════════════════════
 // EVENT BINDING
 // ═══════════════════════════════════════════════════
 function bindEvents() {
-  // Course card clicks handled by persistent delegated listener (set up at boot)
-  // Back from course
   document.getElementById('back-btn')?.addEventListener('click',()=>{S.activeCourse=null;S.activeModule=null;render();});
-  // Module items
+
   document.querySelectorAll('.mod-item[data-mid]').forEach(el=>el.addEventListener('click',()=>{
     if(!S.activeCourse) return;
     if(el.dataset.unlocked==='false'){ toast('Complete the previous module first to unlock this one.','err'); return; }
@@ -1923,158 +1937,165 @@ function bindEvents() {
     if(!course) return;
     const mod=course.modules.find(m=>m.id===mid);
     if(!mod) return;
-    S.activeCourse=course;
-    S.activeModule=mod;
+    S.activeCourse=course; S.activeModule=mod;
     loadAndRender();
   }));
-  // Content tabs (switch between video / pdf / link)
+
   document.querySelectorAll('.content-tab-btn').forEach(btn=>btn.addEventListener('click',e=>{
     S._contentTab=e.currentTarget.dataset.tab;
     render();
   }));
-  // Mark complete (PDF / URL / no-video modules)
-  document.getElementById('mark-btn')?.addEventListener('click',e=>{
+
+  document.getElementById('mark-btn')?.addEventListener('click', async e=>{
     const {cid,mid}=e.currentTarget.dataset;
-    const p=DB.prog(S.session.id);
+    const uid=S.session.id;
+    const p=currentProg();
     if(!p[cid])p[cid]={watched:[],quizScore:null,moduleQuiz:{}};
     if(!p[cid].moduleQuiz)p[cid].moduleQuiz={};
     if(!p[cid].watched.includes(mid))p[cid].watched.push(mid);
-    DB.saveProg(S.session.id,p);
-    updateStreak(S.session.id);
+    S._allProg[uid]=p;
+    await DB.saveProgCourse(uid,cid,p[cid]);
+    await updateStreak(uid);
     const mod=S.activeCourse?.modules.find(m=>m.id===mid);
     toast(mod&&mod.quiz&&mod.quiz.length?'Content done — now take the module quiz':'Module complete!');
     loadAndRender(S._contentTab);
   });
-  // Start quiz (course final OR module quiz)
-  document.querySelectorAll('.start-quiz-btn').forEach(btn=>btn.addEventListener('click',e=>{
+
+  document.querySelectorAll('.start-quiz-btn').forEach(btn=>btn.addEventListener('click', async e=>{
     const cid=e.currentTarget.dataset.cid;
     const mid=e.currentTarget.dataset.mid||null;
-    S.quiz={cid,mid,step:0,answers:[],done:false,score:0};render();
+    const rcount = await DB.getRetakeCount(S.session.id, quizKey(cid,mid));
+    S._retakeCount = rcount;
+    S.quiz={cid,mid,step:0,answers:[],done:false,score:0};
+    render();
   }));
-  // Quiz options
-  document.querySelectorAll('.quiz-opt').forEach(el=>el.addEventListener('click',()=>{
-    const oi=parseInt(el.dataset.oi);const q=S.quiz;
+
+  document.querySelectorAll('.quiz-opt').forEach(el=>el.addEventListener('click', async ()=>{
+    const oi=parseInt(el.dataset.oi); const q=S.quiz;
     const quizArr=getQuizDef(q.cid, q.mid||null);
     q.answers.push(oi);
     if(q.step+1>=quizArr.length){
       const score=Math.round(q.answers.reduce((a,ans,i)=>a+(ans===quizArr[i].ans?1:0),0)/quizArr.length*100);
-      q.score=score;q.done=true;
-      saveQuizResult(q.cid, q.mid||null, score, q.answers);
+      q.score=score; q.done=true;
+      await saveQuizResult(q.cid, q.mid||null, score, q.answers);
     } else {q.step++;}
     render();
   }));
+
   document.getElementById('quiz-exit-btn')?.addEventListener('click',()=>{S.quiz=null;render();});
   document.getElementById('quiz-back-btn')?.addEventListener('click',()=>{S.quiz=null;loadAndRender();});
-  document.getElementById('quiz-retry-btn')?.addEventListener('click',()=>{
-    incrementRetakeCount(S.session.id, quizKey(S.quiz.cid, S.quiz.mid||null));
-    S.quiz={cid:S.quiz.cid,mid:S.quiz.mid||null,step:0,answers:[],done:false,score:0};render();
+  document.getElementById('quiz-retry-btn')?.addEventListener('click', async ()=>{
+    const newCount = await DB.incrementRetakeCount(S.session.id, quizKey(S.quiz.cid, S.quiz.mid||null));
+    S._retakeCount = newCount;
+    S.quiz={cid:S.quiz.cid,mid:S.quiz.mid||null,step:0,answers:[],done:false,score:0};
+    render();
   });
-  // Admin learner rows
+
   document.querySelectorAll('.learner-row').forEach(el=>el.addEventListener('click',()=>{
-    S.selectedUser=el.dataset.uid;S.tab='learners';S.adminSubTab='info';buildSidebar();render();
+    S.selectedUser=el.dataset.uid; S.tab='learners'; S.adminSubTab='info';
+    buildSidebar(); render();
   }));
   document.getElementById('back-learners-btn')?.addEventListener('click',()=>{S.selectedUser=null;S.adminSubTab='info';render();});
-  // Sub-tabs (learner detail page)
   document.querySelectorAll('[data-subtab]').forEach(el=>{
     el.addEventListener('click',()=>{S.adminSubTab=el.dataset.subtab;render();});
   });
-  // Learner search
   document.getElementById('learner-search')?.addEventListener('input',e=>{
     const q=e.target.value.toLowerCase();
     document.querySelectorAll('#learner-tbody tr').forEach(row=>{
       row.style.display=row.textContent.toLowerCase().includes(q)?'':'none';
     });
   });
-  // Learner detail — save edit
-  document.getElementById('save-edit-btn')?.addEventListener('click',e=>{
+
+  document.getElementById('save-edit-btn')?.addEventListener('click', async e=>{
     const uid2=e.currentTarget.dataset.uid;
-    const users=DB.users();
-    const idx=users.findIndex(u=>u.id===uid2);
-    if(idx===-1)return;
-    users[idx].name=document.getElementById('edit-name').value.trim()||users[idx].name;
-    users[idx].email=document.getElementById('edit-email').value.trim()||users[idx].email;
-    users[idx].dept=document.getElementById('edit-dept').value.trim();
-    users[idx].notes=document.getElementById('edit-notes').value.trim();
-    DB.saveUsers(users);
-    toast('Learner details saved');render();
+    const users=await DB.users();
+    const u=users.find(x=>x.id===uid2);
+    if(!u)return;
+    const updated={...u,
+      name:document.getElementById('edit-name').value.trim()||u.name,
+      email:document.getElementById('edit-email').value.trim()||u.email,
+      dept:document.getElementById('edit-dept').value.trim(),
+      notes:document.getElementById('edit-notes').value.trim()
+    };
+    await DB.saveUser(updated);
+    S._allUsers = await DB.users();
+    toast('Learner details saved'); render();
   });
-  // Save password
-  document.getElementById('save-pw-btn')?.addEventListener('click',e=>{
+
+  document.getElementById('save-pw-btn')?.addEventListener('click', async e=>{
     const uid2=e.currentTarget.dataset.uid;
     const pw=document.getElementById('new-pw').value;
     const pw2=document.getElementById('new-pw2').value;
     const msg=document.getElementById('pw-msg');
     if(pw.length<6){msg.innerHTML='<div class="msg-err">Password must be 6+ characters.</div>';return;}
     if(pw!==pw2){msg.innerHTML='<div class="msg-err">Passwords do not match.</div>';return;}
-    const users=DB.users();
-    const idx=users.findIndex(u=>u.id===uid2);
-    if(idx===-1)return;
-    users[idx].pw=pw;
-    DB.saveUsers(users);
+    const users=await DB.users();
+    const u=users.find(x=>x.id===uid2);
+    if(!u)return;
+    await DB.saveUser({...u, pw});
+    S._allUsers = await DB.users();
     toast('Password updated successfully');
     document.getElementById('new-pw').value='';
     document.getElementById('new-pw2').value='';
     msg.innerHTML='<div class="msg-ok">Password changed.</div>';
   });
-  // Disable/enable account
-  document.getElementById('toggle-disable-btn')?.addEventListener('click',e=>{
+
+  document.getElementById('toggle-disable-btn')?.addEventListener('click', async e=>{
     const uid2=e.currentTarget.dataset.uid;
     const isDisabled=e.currentTarget.dataset.disabled==='true';
-    const users=DB.users();
-    const idx=users.findIndex(u=>u.id===uid2);
-    if(idx===-1)return;
-    users[idx].disabled=!isDisabled;
-    DB.saveUsers(users);
-    toast(isDisabled?'Account enabled':'Account disabled');render();
-  });
-  // Export report
-  document.getElementById('export-report-btn')?.addEventListener('click',e=>{
-    const uid=e.currentTarget.dataset.uid;
-    if(!uid){toast('Could not identify learner','err');return;}
-    exportLearnerReport(uid);
-  });
-  // Export quiz CSV
-  document.getElementById('export-quiz-btn')?.addEventListener('click',e=>{
-    const uid=e.currentTarget.dataset.uid;
-    if(!uid){toast('Could not identify learner','err');return;}
-    exportQuizCSV(uid);
-  });
-  // Reset progress
-  document.getElementById('reset-progress-btn')?.addEventListener('click',e=>{
-    if(!confirm('Reset ALL progress for this learner? This cannot be undone.'))return;
-    DB.saveProg(e.currentTarget.dataset.uid,{});
-    toast('Progress reset');render();
-  });
-  // Delete learner
-  document.getElementById('delete-learner-btn')?.addEventListener('click',e=>{
-    if(!confirm('Permanently delete this learner? This cannot be undone.'))return;
-    const uid2=e.currentTarget.dataset.uid;
-    DB.saveUsers(DB.users().filter(u=>u.id!==uid2));
-    localStorage.removeItem('trv_prog_'+uid2);
-    S.selectedUser=null;S.tab='learners';
-    toast('Learner deleted');buildSidebar();render();
+    const users=await DB.users();
+    const u=users.find(x=>x.id===uid2);
+    if(!u)return;
+    await DB.saveUser({...u, disabled:!isDisabled});
+    S._allUsers = await DB.users();
+    toast(isDisabled?'Account enabled':'Account disabled'); render();
   });
 
-  // Admin course actions
+  document.getElementById('export-report-btn')?.addEventListener('click',e=>{
+    exportLearnerReport(e.currentTarget.dataset.uid);
+  });
+  document.getElementById('export-quiz-btn')?.addEventListener('click',e=>{
+    exportQuizCSV(e.currentTarget.dataset.uid);
+  });
+
+  document.getElementById('reset-progress-btn')?.addEventListener('click', async e=>{
+    if(!confirm('Reset ALL progress for this learner? This cannot be undone.'))return;
+    const uid2=e.currentTarget.dataset.uid;
+    await DB.resetProg(uid2);
+    S._allProg[uid2]={};
+    toast('Progress reset'); render();
+  });
+
+  document.getElementById('delete-learner-btn')?.addEventListener('click', async e=>{
+    if(!confirm('Permanently delete this learner? This cannot be undone.'))return;
+    const uid2=e.currentTarget.dataset.uid;
+    await DB.deleteUser(uid2);
+    await DB.resetProg(uid2);
+    await DB.resetRetakes(uid2);
+    S._allUsers = S._allUsers?.filter(u=>u.id!==uid2);
+    S._allProg[uid2]={};
+    S.selectedUser=null; S.tab='learners';
+    toast('Learner deleted'); buildSidebar(); render();
+  });
+
   document.getElementById('add-course-btn')?.addEventListener('click',()=>openAddCourseModal(null));
   document.querySelectorAll('.edit-course-btn').forEach(el=>el.addEventListener('click',e=>{
     e.stopPropagation();
     const c=COURSES.find(x=>x.id===el.dataset.cid);
     openAddCourseModal(c);
   }));
-  document.querySelectorAll('.delete-course-btn').forEach(el=>el.addEventListener('click',e=>{
+  document.querySelectorAll('.delete-course-btn').forEach(el=>el.addEventListener('click', async e=>{
     e.stopPropagation();
     if(!confirm('Delete this course? Learner progress for this course will remain in storage.'))return;
-    const idx=COURSES.findIndex(c=>c.id===el.dataset.cid);
-    if(idx!==-1){COURSES.splice(idx,1);saveCourses();}
-    toast('Course deleted');render();
+    await DB.deleteCourse(el.dataset.cid);
+    COURSES = await DB.courses();
+    toast('Course deleted'); render();
   }));
-  // Add learner button
+
   document.getElementById('add-learner-btn')?.addEventListener('click',()=>openAddLearnerModal());
   document.getElementById('add-learner-btn2')?.addEventListener('click',()=>openAddLearnerModal());
 
-  // Settings page handlers
-  document.getElementById('st-save-btn')?.addEventListener('click',()=>{
+  document.getElementById('st-save-btn')?.addEventListener('click', async ()=>{
     const pass=parseInt(document.getElementById('st-pass').value);
     const retakes=parseInt(document.getElementById('st-retakes').value);
     const msg=document.getElementById('st-msg');
@@ -2082,244 +2103,37 @@ function bindEvents() {
     if(isNaN(retakes)||retakes<0){msg.innerHTML='<div class="msg-err">Retakes must be 0 or more.</div>';return;}
     SETTINGS.passThreshold=pass;
     SETTINGS.maxRetakes=retakes;
-    saveSettings();
+    await DB.saveSettings(SETTINGS);
     msg.innerHTML='<div class="msg-ok">Settings saved.</div>';
     setTimeout(()=>render(),800);
   });
-  document.getElementById('st-reset-btn')?.addEventListener('click',()=>{
+  document.getElementById('st-reset-btn')?.addEventListener('click', async ()=>{
     if(!confirm('Reset to defaults? (80% pass, 2 retakes)'))return;
     SETTINGS={...DEFAULT_SETTINGS};
-    saveSettings();
-    toast('Settings reset to defaults');render();
+    await DB.saveSettings(SETTINGS);
+    toast('Settings reset to defaults'); render();
   });
   document.getElementById('st-pin-save-btn')?.addEventListener('click',()=>{
     const pin=document.getElementById('st-admin-pin')?.value.trim();
     const pmsg=document.getElementById('st-pin-msg');
     if(!pin){pmsg.innerHTML='<div class="msg-err">Please enter a PIN.</div>';return;}
+    sessionStorage.setItem('trv_admin_pin',pin);
     localStorage.setItem('trv_admin_pin',pin);
     pmsg.innerHTML='<div class="msg-ok">PIN saved.</div>';
     setTimeout(()=>{if(pmsg)pmsg.innerHTML='';},2000);
   });
   document.querySelectorAll('.reset-attempts-btn').forEach(btn=>{
-    btn.addEventListener('click',()=>{
-      const uid2=btn.dataset.uid;
-      COURSES.forEach(c=>localStorage.removeItem('trv_retakes_'+uid2+'_'+c.id));
-      toast('Quiz attempts reset for this learner');render();
+    btn.addEventListener('click', async ()=>{
+      await DB.resetRetakes(btn.dataset.uid);
+      toast('Quiz attempts reset for this learner'); render();
     });
   });
 
-  // Modal events are bound by openModal() directly — not here
-  // Video player enforcement
-  initVideoPlayer();
   initYouTubePlayer();
 }
 
-// ═══════════════════════════════════════════════════
-// VIDEO ENFORCEMENT
-// ═══════════════════════════════════════════════════
-function initVideoPlayer() {
-  const video=document.getElementById('course-video');
-  if(!video)return;
-  const m=S.activeModule;
-  const isAlreadyWatched=(DB.prog(S.session.id)[S.activeCourse?.id]?.watched||[]).includes(m?.id);
-  if(isAlreadyWatched)return; // already completed, no restrictions
-
-  let lastTime=0;
-  let completed=false;
-
-  video.addEventListener('timeupdate',()=>{
-    const vpf=document.getElementById('vpf');
-    if(vpf&&video.duration>0){
-      vpf.style.width=(video.currentTime/video.duration*100)+'%';
-    }
-    // If user tries to seek forward more than 3s ahead of last watched time
-    if(video.currentTime>lastTime+3){
-      video.currentTime=lastTime;
-      toast('Please watch the video without skipping','err');
-    } else {
-      lastTime=Math.max(lastTime,video.currentTime);
-    }
-    if(!completed&&video.duration>0&&video.currentTime>=video.duration-1){
-      completed=true;
-      markVideoComplete(m.id,S.activeCourse.id);
-    }
-  });
-
-  // Disable right-click context menu
-  video.addEventListener('contextmenu',e=>e.preventDefault());
-  // Block rate change
-  video.addEventListener('ratechange',()=>{if(video.playbackRate!==1)video.playbackRate=1;});
-}
-
-// ─────────────────────────────────────────────────────
-// YouTube IFrame Player enforcement
-// ─────────────────────────────────────────────────────
-
-function initYouTubePlayer() {
-  const wrap = document.getElementById('yt-player-wrap');
-  if (!wrap) return;
-  const m   = S.activeModule;
-  const cid = S.activeCourse?.id;
-  if (!m || !m.ytId) return;
-  // file:// guard already handled in renderCoursePlayer — no iframe rendered there
-  if (location.protocol === 'file:') return;
-
-  const isAlreadyWatched = (DB.prog(S.session.id)[cid]?.watched || []).includes(m.id);
-  const ytVidId = m.ytId;
-
-  // ── Load the IFrame JS API once, then create the player ───────────────────
-  // On HTTP(S) the JS API works correctly and gives us reliable getCurrentTime,
-  // getDuration, seekTo and onStateChange — far more reliable than postMessage.
-  function createPlayer() {
-    if (!document.getElementById('yt-player')) return; // guard re-render race
-
-    let lastTime  = 0;
-    let completed = false;
-    let tickTimer = null;
-
-    function showEmbedError(code) {
-      clearInterval(tickTimer);
-      const isEmbedBlocked = [101, 150, 153].includes(code);
-      wrap.innerHTML = `
-        <div style="width:100%;min-height:200px;display:flex;align-items:center;justify-content:center;
-                    background:#0f0f0f;border-radius:6px;padding:24px;box-sizing:border-box">
-          <div style="text-align:center;max-width:340px">
-            <div style="font-size:40px;margin-bottom:12px">${isEmbedBlocked ? '🚫' : '⚠️'}</div>
-            <p style="color:#fff;font-weight:700;font-size:15px;margin-bottom:8px">
-              ${isEmbedBlocked ? 'Embedding disabled for this video' : 'Video unavailable'}
-            </p>
-            <p style="color:rgba(255,255,255,0.55);font-size:12px;margin-bottom:18px;line-height:1.5">
-              ${isEmbedBlocked
-                ? 'The video owner has disabled embedding. Ask your admin to replace this with a video that allows embedding, or upload a video file instead.'
-                : `YouTube error ${code} — the video may be private, deleted, or region-restricted.`}
-            </p>
-            <a href="https://www.youtube.com/watch?v=${encodeURIComponent(ytVidId)}"
-               target="_blank" rel="noopener noreferrer"
-               style="display:inline-block;padding:9px 20px;background:#FF0000;color:#fff;
-                      border-radius:6px;font-size:13px;font-weight:600;text-decoration:none">
-              Watch on YouTube ↗
-            </a>
-          </div>
-        </div>`;
-      const bar = document.getElementById('yt-vpf');
-      if (bar) bar.style.display = 'none';
-    }
-
-    new YT.Player('yt-player', {
-      videoId: ytVidId,
-      width:  '100%',
-      height: '100%',
-      playerVars: {
-        rel:            0,
-        modestbranding: 1,
-        iv_load_policy: 3,
-        controls:       1,
-        origin:         location.origin,
-      },
-      events: {
-        onReady(e) {
-          // nothing to do on ready
-        },
-        onError(e) {
-          clearInterval(tickTimer);
-          showEmbedError(e.data);
-        },
-        onStateChange(e) {
-          if (e.data === YT.PlayerState.PLAYING) {
-            clearInterval(tickTimer);
-            tickTimer = setInterval(() => {
-              // Guard: player may have been destroyed by a re-render
-              if (!document.getElementById('yt-player') &&
-                  !document.querySelector('iframe#yt-iframe')) {
-                clearInterval(tickTimer); return;
-              }
-              let cur, dur;
-              try {
-                cur = e.target.getCurrentTime();
-                dur = e.target.getDuration();
-              } catch(_) { clearInterval(tickTimer); return; }
-
-              // Update progress bar
-              const bar = document.getElementById('yt-vpf');
-              if (bar && dur > 0) bar.style.width = (cur / dur * 100) + '%';
-
-              if (isAlreadyWatched || completed || !(dur > 0)) return;
-
-              // Snap back on forward seek (> 4 s tolerance)
-              if (cur > lastTime + 4) {
-                try { e.target.seekTo(lastTime, true); } catch(_) {}
-                toast('Please watch the video without skipping ⛔', 'err');
-                return;
-              }
-              lastTime = Math.max(lastTime, cur);
-
-              if (cur >= dur - 2) {
-                completed = true;
-                clearInterval(tickTimer);
-                markVideoComplete(m.id, cid);
-              }
-            }, 500);
-
-          } else {
-            clearInterval(tickTimer);
-          }
-
-          // Ended state — backup completion trigger
-          if (e.data === YT.PlayerState.ENDED && !completed && !isAlreadyWatched) {
-            completed = true;
-            clearInterval(tickTimer);
-            markVideoComplete(m.id, cid);
-          }
-        },
-      },
-    });
-  }
-
-  // Load YT script once, queue createPlayer until API is ready
-  if (window.YT && window.YT.Player) {
-    createPlayer();
-  } else if (!window._ytLoading) {
-    window._ytLoading = true;
-    window._ytQueue = window._ytQueue || [];
-    window._ytQueue.push(createPlayer);
-    window.onYouTubeIframeAPIReady = function() {
-      (window._ytQueue || []).splice(0).forEach(fn => fn());
-    };
-    const tag = document.createElement('script');
-    tag.src = 'https://www.youtube.com/iframe_api';
-    document.head.appendChild(tag);
-  } else {
-    // Script already loading — queue our callback
-    window._ytQueue = window._ytQueue || [];
-    window._ytQueue.push(createPlayer);
-    // Ensure the ready handler will flush the queue (in case it fired already)
-    if (window.YT && window.YT.Player) createPlayer();
-  }
-}
-
-function markVideoComplete(mid, cid) {
-  const p=DB.prog(S.session.id);
-  if(!p[cid])p[cid]={watched:[],quizScore:null,moduleQuiz:{}};
-  if(!p[cid].moduleQuiz)p[cid].moduleQuiz={};
-  if(!p[cid].watched.includes(mid)){
-    p[cid].watched.push(mid);
-    DB.saveProg(S.session.id,p);
-    updateStreak(S.session.id);
-    S.videoWatched[mid]=true;
-    const mod=S.activeCourse?.modules.find(m=>m.id===mid);
-    const hasQuiz=mod&&mod.quiz&&mod.quiz.length;
-    const statusMsg=document.getElementById('video-status-msg');
-    if(statusMsg)statusMsg.innerHTML=`<span class="badge badge-green" style="font-size:12px;padding:5px 14px">✓ Video complete!${hasQuiz?' Take the module quiz below.':''}</span>`;
-    toast(hasQuiz?'🎬 Video done — now take the module quiz':'🎉 Video complete!');
-    // Re-render so the quiz button appears
-    setTimeout(()=>loadAndRender(),1200);
-  }
-}
-
-// ── Persistent delegated listeners (set up once, never re-attached) ──────────
-// Course card click — works even after innerHTML re-renders
+// Course card click (delegated)
 document.getElementById('main-content').addEventListener('click', e=>{
-  // Course card
   const card = e.target.closest('.course-card[data-cid]');
   if (card && S.session && S.session.role==='learner') {
     const c = COURSES.find(x => x.id === card.dataset.cid);
@@ -2331,12 +2145,108 @@ document.getElementById('main-content').addEventListener('click', e=>{
   }
 });
 
-// Prevent browser from opening dropped files as a new tab
 document.addEventListener('dragover', e=>{ if(!e.target.closest('.drop-zone')) e.preventDefault(); });
 document.addEventListener('drop',     e=>{ if(!e.target.closest('.drop-zone')) e.preventDefault(); });
 
 // ═══════════════════════════════════════════════════
+// YOUTUBE PLAYER
+// ═══════════════════════════════════════════════════
+function initYouTubePlayer() {
+  const wrap = document.getElementById('yt-player-wrap');
+  if (!wrap) return;
+  const m   = S.activeModule;
+  const cid = S.activeCourse?.id;
+  if (!m || !m.ytId) return;
+  if (location.protocol === 'file:') return;
+
+  const p = currentProg();
+  const isAlreadyWatched = (p[cid]?.watched || []).includes(m.id);
+  const ytVidId = m.ytId;
+
+  function createPlayer() {
+    if (!document.getElementById('yt-player')) return;
+    let lastTime=0, completed=false, tickTimer=null;
+
+    function showEmbedError(code) {
+      clearInterval(tickTimer);
+      const isEmbedBlocked=[101,150,153].includes(code);
+      wrap.innerHTML=`<div style="width:100%;min-height:200px;display:flex;align-items:center;justify-content:center;background:#0f0f0f;border-radius:6px;padding:24px;box-sizing:border-box">
+        <div style="text-align:center;max-width:340px">
+          <div style="font-size:40px;margin-bottom:12px">${isEmbedBlocked?'🚫':'⚠️'}</div>
+          <p style="color:#fff;font-weight:700;font-size:15px;margin-bottom:8px">${isEmbedBlocked?'Embedding disabled for this video':'Video unavailable'}</p>
+          <p style="color:rgba(255,255,255,0.55);font-size:12px;margin-bottom:18px;line-height:1.5">${isEmbedBlocked?'The video owner has disabled embedding. Ask your admin to replace this video.':`YouTube error ${code} — the video may be private, deleted, or region-restricted.`}</p>
+          <a href="https://www.youtube.com/watch?v=${encodeURIComponent(ytVidId)}" target="_blank" rel="noopener noreferrer"
+             style="display:inline-block;padding:9px 20px;background:#FF0000;color:#fff;border-radius:6px;font-size:13px;font-weight:600;text-decoration:none">Watch on YouTube ↗</a>
+        </div>
+      </div>`;
+      const bar=document.getElementById('yt-vpf'); if(bar)bar.style.display='none';
+    }
+
+    new YT.Player('yt-player', {
+      videoId: ytVidId, width:'100%', height:'100%',
+      playerVars:{rel:0,modestbranding:1,iv_load_policy:3,controls:1,origin:location.origin},
+      events:{
+        onError(e){clearInterval(tickTimer);showEmbedError(e.data);},
+        onStateChange(e){
+          if(e.data===YT.PlayerState.PLAYING){
+            clearInterval(tickTimer);
+            tickTimer=setInterval(()=>{
+              if(!document.getElementById('yt-player')&&!document.querySelector('iframe#yt-iframe')){clearInterval(tickTimer);return;}
+              let cur,dur;
+              try{cur=e.target.getCurrentTime();dur=e.target.getDuration();}catch(_){clearInterval(tickTimer);return;}
+              const bar=document.getElementById('yt-vpf');
+              if(bar&&dur>0)bar.style.width=(cur/dur*100)+'%';
+              if(isAlreadyWatched||completed||!(dur>0))return;
+              if(cur>lastTime+4){try{e.target.seekTo(lastTime,true);}catch(_){}toast('Please watch the video without skipping ⛔','err');return;}
+              lastTime=Math.max(lastTime,cur);
+              if(cur>=dur-2){completed=true;clearInterval(tickTimer);markVideoComplete(m.id,cid);}
+            },500);
+          } else {clearInterval(tickTimer);}
+          if(e.data===YT.PlayerState.ENDED&&!completed&&!isAlreadyWatched){completed=true;clearInterval(tickTimer);markVideoComplete(m.id,cid);}
+        },
+      },
+    });
+  }
+
+  if(window.YT&&window.YT.Player){createPlayer();}
+  else if(!window._ytLoading){
+    window._ytLoading=true; window._ytQueue=window._ytQueue||[];
+    window._ytQueue.push(createPlayer);
+    window.onYouTubeIframeAPIReady=function(){(window._ytQueue||[]).splice(0).forEach(fn=>fn());};
+    const tag=document.createElement('script');tag.src='https://www.youtube.com/iframe_api';document.head.appendChild(tag);
+  } else {
+    window._ytQueue=window._ytQueue||[];
+    window._ytQueue.push(createPlayer);
+    if(window.YT&&window.YT.Player)createPlayer();
+  }
+}
+
+async function markVideoComplete(mid, cid) {
+  const uid=S.session.id;
+  const p=currentProg();
+  if(!p[cid])p[cid]={watched:[],quizScore:null,moduleQuiz:{}};
+  if(!p[cid].moduleQuiz)p[cid].moduleQuiz={};
+  if(!p[cid].watched.includes(mid)){
+    p[cid].watched.push(mid);
+    S._allProg[uid]=p;
+    await DB.saveProgCourse(uid,cid,p[cid]);
+    await updateStreak(uid);
+    S.videoWatched[mid]=true;
+    const mod=S.activeCourse?.modules.find(m=>m.id===mid);
+    const hasQuiz=mod&&mod.quiz&&mod.quiz.length;
+    const statusMsg=document.getElementById('video-status-msg');
+    if(statusMsg)statusMsg.innerHTML=`<span class="badge badge-green" style="font-size:12px;padding:5px 14px">✓ Video complete!${hasQuiz?' Take the module quiz below.':''}</span>`;
+    toast(hasQuiz?'🎬 Video done — now take the module quiz':'🎉 Video complete!');
+    setTimeout(()=>loadAndRender(),1200);
+  }
+}
+
+// ═══════════════════════════════════════════════════
 // BOOT
 // ═══════════════════════════════════════════════════
-const existing=DB.session();
-if(existing){launch(existing);}
+(async () => {
+  const existing = DB.session();
+  if (existing) {
+    await boot(existing);
+  }
+})();
