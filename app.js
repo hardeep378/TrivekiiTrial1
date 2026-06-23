@@ -697,7 +697,7 @@ document.getElementById('logout-btn').addEventListener('click',()=>{
   DB.clearSession();
   // Revoke any object URLs
   if (S._pdfUrl && S._pdfUrl.startsWith('blob:')) URL.revokeObjectURL(S._pdfUrl);
-  S = {session:null,tab:'dashboard',activeCourse:null,activeModule:null,quiz:null,selectedUser:null,authMode:'login',adminSubTab:'info',videoWatched:{},_pdfUrl:null,_ytId:null,_contentTab:null,_allUsers:null,_allProg:{}};
+  S = {session:null,tab:'dashboard',activeCourse:null,activeModule:null,quiz:null,selectedUser:null,authMode:'login',adminSubTab:'info',videoWatched:{},_pdfUrl:null,_videoUrl:null,_ytId:null,_contentTab:null,_allUsers:null,_allProg:{}};
   COURSES = []; SETTINGS = {...DEFAULT_SETTINGS};
   // Reset DB caches
   DB._users=null; DB._courses=null; DB._progMap={}; DB._settings=null;
@@ -777,16 +777,28 @@ function render() {
 }
 
 async function loadAndRender(preferredTab) {
-  S._pdfUrl = null; S._ytId = null; S._contentTab = null;
+  // Revoke previous object URLs to avoid memory leaks
+  if (S._pdfUrl   && S._pdfUrl.startsWith('blob:'))   URL.revokeObjectURL(S._pdfUrl);
+  S._pdfUrl = null; S._videoUrl = null; S._ytId = null; S._contentTab = null;
+
   if (S.activeCourse && S.activeModule && S.activeModule.id) {
     const m = S.activeModule;
     if (m.ytId) S._ytId = m.ytId;
 
-    // PDF: fetch from Supabase storage and create a local object URL
+    // Video: use public Supabase storage URL directly (stream without blob)
+    if (m.video) {
+      try {
+        const videoUrl = SB.publicUrl('videos', m.id + '.mp4');
+        const res = await fetch(videoUrl, { method: 'HEAD', headers: { 'apikey': SUPABASE_ANON } });
+        if (res.ok) S._videoUrl = videoUrl;
+      } catch(e) { console.warn('Video fetch failed', e); }
+    }
+
+    // PDF: fetch as blob so iframe src works cross-origin
     if (m.pdf) {
       try {
-        const pdfPublicUrl = SB.publicUrl('pdfs', m.id + '.pdf');
-        const res = await fetch(pdfPublicUrl, { headers: { 'apikey': SUPABASE_ANON } });
+        const pdfUrl = SB.publicUrl('pdfs', m.id + '.pdf');
+        const res = await fetch(pdfUrl, { headers: { 'apikey': SUPABASE_ANON } });
         if (res.ok) {
           const blob = await res.blob();
           S._pdfUrl = URL.createObjectURL(blob);
@@ -794,11 +806,10 @@ async function loadAndRender(preferredTab) {
       } catch(e) { console.warn('PDF fetch failed', e); }
     }
 
-    // Videos: served directly via YouTube (ytId) or the module.videoUrl field
-    // (admins store YouTube IDs; uploaded videos are not supported in Supabase free tier for large files)
     const avail = [];
-    if (m.ytId)   avail.push('youtube');
-    if (S._pdfUrl) avail.push('pdf');
+    if (S._videoUrl) avail.push('video');
+    if (m.ytId)      avail.push('youtube');
+    if (S._pdfUrl)   avail.push('pdf');
     S._contentTab = (preferredTab && avail.includes(preferredTab)) ? preferredTab : (avail[0]||null);
   }
   render();
@@ -920,11 +931,13 @@ function renderCoursePlayer() {
   const watched=(p[c.id]?.watched||[]);
   const isWatched=watched.includes(m.id);
 
+  const hasVideo = !!S._videoUrl;
   const hasPdf   = !!S._pdfUrl;
   const hasYt    = !!S._ytId;
   const sources = [];
-  if (hasYt)  sources.push({key:'youtube', label:'▶ YouTube'});
-  if (hasPdf) sources.push({key:'pdf',     label:'📄 PDF'});
+  if (hasVideo) sources.push({key:'video',   label:'🎬 Video'});
+  if (hasYt)    sources.push({key:'youtube', label:'▶ YouTube'});
+  if (hasPdf)   sources.push({key:'pdf',     label:'📄 PDF'});
   let activeTab = S._contentTab;
   if (!activeTab || !sources.find(s=>s.key===activeTab)) activeTab = sources[0]?.key || null;
 
@@ -944,6 +957,15 @@ function renderCoursePlayer() {
         <p style="color:rgba(255,255,255,0.6);font-size:13px">${esc(m.title)}</p>
         <p style="color:rgba(255,255,255,0.35);font-size:11px;margin-top:4px">No content uploaded yet</p>
       </div>
+    </div>`;
+  } else if (activeTab==='video') {
+    mediaBlock += `<div class="video-wrapper">
+      <video id="course-video" src="${S._videoUrl}" controls controlsList="nodownload nofullscreen" disablePictureInPicture
+        style="width:100%;height:100%"></video>
+      <div class="video-progress-bar"><div class="video-progress-fill" id="vpf" style="width:0%"></div></div>
+    </div>
+    <div style="display:flex;gap:10px;align-items:center;margin-bottom:12px">
+      <span style="font-size:12px;color:var(--muted)">🎬 Watch the full video to continue — skipping is not allowed.</span>
     </div>`;
   } else if (activeTab==='pdf') {
     mediaBlock += `<div class="pdf-wrapper">
@@ -1004,7 +1026,7 @@ function renderCoursePlayer() {
             const modQuizPassed=modQuizScore!=null&&modQuizScore>=SETTINGS.passThreshold;
             const moduleComplete=isModuleComplete(uid,c.id,m.id,p);
             if (!isWatched) {
-              if (hasYt && activeTab==='youtube') {
+              if ((hasVideo && activeTab==='video') || (hasYt && activeTab==='youtube')) {
                 return `<div id="video-status-msg" style="font-size:12px;color:var(--muted)">⏳ Watch the full video to continue${hasPdf?' (or switch tabs and mark complete after reviewing the PDF)':''}</div>`;
               }
               return `<button class="btn-primary btn-sm" id="mark-btn" data-cid="${c.id}" data-mid="${m.id}" style="width:auto">Mark as complete</button>`;
@@ -1587,7 +1609,15 @@ function moduleRow(m, i) {
     <div class="field"><label>Duration</label><input type="text" class="mod-dur" data-mod-id="${m.id}" value="${esc(m.dur)}" placeholder="15 min"></div>
     <div class="field"><label>Description</label><input type="text" class="mod-desc" data-mod-id="${m.id}" value="${esc(m.description||'')}" placeholder="Brief description"></div>
     <div style="margin-top:6px;padding:12px;border:1px solid var(--border);border-radius:var(--r);background:#fff">
-      <p style="font-weight:600;font-size:12px;margin-bottom:8px">📎 Learning content</p>
+      <p style="font-weight:600;font-size:12px;margin-bottom:8px">📎 Learning content <span style="color:var(--muted);font-weight:400">(add at least one)</span></p>
+      <div class="field">
+        <label>🎬 Video (.mp4) — upload to Supabase storage</label>
+        <div class="drop-zone" id="dz-${m.id}-video" data-kind="video" data-mod-id="${m.id}">
+          <div style="font-size:22px">🎬</div>
+          <p class="dz-status" data-key="${m.id}_video">${m.video?'✅ Video uploaded — click or drop to replace':'Click or drop an .mp4 file'}</p>
+          <input type="file" class="mod-file-input" data-key="${m.id}_video" accept=".mp4,video/mp4" style="display:none">
+        </div>
+      </div>
       <div class="field">
         <label>▶ YouTube video link — optional</label>
         <input type="text" class="mod-yt" data-mod-id="${m.id}" value="${esc(m.ytId||'')}"
@@ -1728,29 +1758,43 @@ function bindDropZones() {
   });
 }
 
-// Upload PDF to Supabase Storage bucket "pdfs"
+// Upload video or PDF to Supabase Storage
 async function handleFileUpload(file, storeKey, dz) {
   if (!file) return;
-  const kind = dz.dataset.kind;
-  if (kind !== 'pdf') { toast('Only PDFs are supported for upload.','err'); return; }
-  const isPdf = file.type==='application/pdf' || /\.pdf$/i.test(file.name);
-  if (!isPdf) { toast('That is not a PDF file.','err'); return; }
-  if (file.size > 50*1024*1024) { toast('PDF is too large (>50MB).','err'); return; }
+  const kind = dz.dataset.kind; // 'video' or 'pdf'
+  const pEl  = dz.querySelector('p');
 
-  const pEl = dz.querySelector('p');
-  pEl.textContent = '⏳ Uploading to Supabase…';
+  if (kind === 'pdf') {
+    const isPdf = file.type==='application/pdf' || /\.pdf$/i.test(file.name);
+    if (!isPdf) { toast('That is not a PDF file.','err'); return; }
+    if (file.size > 50*1024*1024) { toast('PDF is too large (>50MB).','err'); return; }
+    pEl.textContent = '⏳ Uploading PDF to Supabase…';
+    const modId = storeKey.replace('_pdf','');
+    try {
+      await SB.uploadFile('pdfs', modId + '.pdf', file, 'application/pdf');
+      dz.dataset.uploaded = 'true';
+      pEl.textContent = '✅ ' + file.name + ' uploaded';
+      toast('PDF uploaded ✅');
+    } catch(err) {
+      pEl.textContent = 'Upload failed — try again';
+      toast('Upload failed: ' + err.message, 'err');
+    }
 
-  // storeKey is "<modId>_pdf" — derive the module ID
-  const modId = storeKey.replace('_pdf','');
-
-  try {
-    await SB.uploadFile('pdfs', modId + '.pdf', file, 'application/pdf');
-    dz.dataset.uploaded = 'true';
-    pEl.textContent = '✅ ' + file.name + ' uploaded';
-    toast('PDF uploaded to Supabase ✅');
-  } catch(err) {
-    pEl.textContent = 'Upload failed — try again';
-    toast('Upload failed: ' + err.message, 'err');
+  } else if (kind === 'video') {
+    const isVideo = /^video\//.test(file.type) || /\.(mp4)$/i.test(file.name);
+    if (!isVideo) { toast('Please upload an .mp4 file.','err'); return; }
+    if (file.size > 500*1024*1024) { toast('Video is too large (>500MB). Consider compressing it first.','err'); return; }
+    pEl.textContent = '⏳ Uploading video to Supabase…';
+    const modId = storeKey.replace('_video','');
+    try {
+      await SB.uploadFile('videos', modId + '.mp4', file, 'video/mp4');
+      dz.dataset.uploaded = 'true';
+      pEl.textContent = '✅ ' + file.name + ' uploaded';
+      toast('Video uploaded ✅');
+    } catch(err) {
+      pEl.textContent = 'Upload failed — try again';
+      toast('Upload failed: ' + err.message, 'err');
+    }
   }
 }
 
@@ -1805,14 +1849,17 @@ async function saveCourseFromModal() {
       const ytId=parseYtId(ytRaw);
       if(ytRaw&&!ytId) errors.push(`Module "${t}": the YouTube link/ID doesn't look valid.`);
 
-      const hasPdfUploaded = el.querySelector('.drop-zone')?.dataset.uploaded === 'true';
-      // Also check if originally had PDF (edit mode)
-      const existingCourse = COURSES.find(c=>c.id===existingCid);
-      const existingMod = existingCourse?.modules.find(m=>m.id===mid);
-      const hasPdf = hasPdfUploaded || (existingMod?.pdf || false);
+      const existingCourse   = COURSES.find(c=>c.id===existingCid);
+      const existingMod      = existingCourse?.modules.find(m=>m.id===mid);
+      const pdfDz            = el.querySelector('.drop-zone[data-kind="pdf"]');
+      const videoDz          = el.querySelector('.drop-zone[data-kind="video"]');
+      const hasPdfUploaded   = pdfDz?.dataset.uploaded === 'true';
+      const hasVideoUploaded = videoDz?.dataset.uploaded === 'true';
+      const hasPdf   = hasPdfUploaded   || (existingMod?.pdf   || false);
+      const hasVideo = hasVideoUploaded || (existingMod?.video || false);
 
-      if (!ytId && !hasPdf) {
-        errors.push(`Module "${t}" needs at least one content source (YouTube video or PDF).`);
+      if (!ytId && !hasPdf && !hasVideo) {
+        errors.push(`Module "${t}" needs at least one content source (uploaded video, PDF, or YouTube link).`);
       }
 
       const modQuiz=[];
@@ -1826,7 +1873,7 @@ async function saveCourseFromModal() {
       });
 
       modules.push({id:mid,title:t,dur:d||'—',description:desc,quiz:modQuiz,
-        video:false, pdf:hasPdf, ytId:ytId||''});
+        video:hasVideo, pdf:hasPdf, ytId:ytId||''});
     });
 
     if(!modules.length) errors.push('At least one module is required.');
@@ -2192,7 +2239,42 @@ function bindEvents() {
     });
   });
 
+  initVideoPlayer();
   initYouTubePlayer();
+}
+
+// ═══════════════════════════════════════════════════
+// DIRECT VIDEO PLAYER ENFORCEMENT
+// ═══════════════════════════════════════════════════
+function initVideoPlayer() {
+  const video = document.getElementById('course-video');
+  if (!video) return;
+  const m = S.activeModule;
+  const cid = S.activeCourse?.id;
+  const p = currentProg();
+  const isAlreadyWatched = (p[cid]?.watched || []).includes(m?.id);
+  if (isAlreadyWatched) return;
+
+  let lastTime  = 0;
+  let completed = false;
+
+  video.addEventListener('timeupdate', () => {
+    const vpf = document.getElementById('vpf');
+    if (vpf && video.duration > 0) vpf.style.width = (video.currentTime / video.duration * 100) + '%';
+    // Anti-skip: snap back if user jumps more than 3s ahead
+    if (video.currentTime > lastTime + 3) {
+      video.currentTime = lastTime;
+      toast('Please watch the video without skipping', 'err');
+    } else {
+      lastTime = Math.max(lastTime, video.currentTime);
+    }
+    if (!completed && video.duration > 0 && video.currentTime >= video.duration - 1) {
+      completed = true;
+      markVideoComplete(m.id, cid);
+    }
+  });
+  video.addEventListener('contextmenu', e => e.preventDefault());
+  video.addEventListener('ratechange', () => { if (video.playbackRate !== 1) video.playbackRate = 1; });
 }
 
 // Course card click (delegated)
@@ -2260,12 +2342,26 @@ function initYouTubePlayer() {
               const bar=document.getElementById('yt-vpf');
               if(bar&&dur>0)bar.style.width=(cur/dur*100)+'%';
               if(isAlreadyWatched||completed||!(dur>0))return;
-              if(cur>lastTime+4){try{e.target.seekTo(lastTime,true);}catch(_){}toast('Please watch the video without skipping ⛔','err');return;}
+              // Anti-skip: snap back if user jumps >4s ahead of furthest watched point
+              if(cur>lastTime+4){
+                try{e.target.seekTo(lastTime,true);}catch(_){}
+                toast('Please watch the video without skipping ⛔','err');
+                return;
+              }
               lastTime=Math.max(lastTime,cur);
               if(cur>=dur-2){completed=true;clearInterval(tickTimer);markVideoComplete(m.id,cid);}
             },500);
           } else {clearInterval(tickTimer);}
-          if(e.data===YT.PlayerState.ENDED&&!completed&&!isAlreadyWatched){completed=true;clearInterval(tickTimer);markVideoComplete(m.id,cid);}
+          // ENDED: only mark complete if they actually watched through (lastTime near end)
+          if(e.data===YT.PlayerState.ENDED&&!completed&&!isAlreadyWatched){
+            let finalDur=0;try{finalDur=e.target.getDuration();}catch(_){}
+            if(finalDur>0&&lastTime>=finalDur-5){
+              completed=true;clearInterval(tickTimer);markVideoComplete(m.id,cid);
+            } else {
+              try{e.target.seekTo(lastTime,true);e.target.playVideo();}catch(_){}
+              toast('Please watch the video without skipping ⛔','err');
+            }
+          }
         },
       },
     });
