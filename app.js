@@ -351,6 +351,26 @@ const DB = {
     await this._saveMeta(learnerId, meta);
   },
 
+  // ── VIDEO POSITION (resume playback) ──────────────────────────────────────
+  // Stored in __meta as video_pos: { [cid_mid]: seconds }
+  async getVideoPosition(learnerId, cid, mid) {
+    const meta = await this._meta(learnerId);
+    return (meta.video_pos || {})[cid+"_"+mid] || 0;
+  },
+  async saveVideoPosition(learnerId, cid, mid, seconds) {
+    const meta = await this._meta(learnerId);
+    if (!meta.video_pos) meta.video_pos = {};
+    meta.video_pos[cid+"_"+mid] = Math.floor(seconds);
+    await this._saveMeta(learnerId, meta);
+  },
+  async clearVideoPosition(learnerId, cid, mid) {
+    const meta = await this._meta(learnerId);
+    if (meta.video_pos) {
+      delete meta.video_pos[cid+"_"+mid];
+      await this._saveMeta(learnerId, meta);
+    }
+  },
+
   // ── SETTINGS ───────────────────────────────────────────────────────────────
   async settings() {
     if (this._settings) return this._settings;
@@ -1908,7 +1928,7 @@ function exportAllLearnersCSV() {
       const passed   = isCoursePassed(u.id, c.id, u.p);
       const status   = passed ? 'Completed' : pct > 0 ? 'In progress' : 'Not started';
       return [
-        `${wl.length}/${c.modules.length}`,
+        `${wl.length} of ${c.modules.length}`,
         pct + '%',
         sc != null ? sc + '%' : 'Not attempted',
         status,
@@ -1919,7 +1939,7 @@ function exportAllLearnersCSV() {
       u.email,
       u.dept || '',
       u.overall + '%',
-      `${u.passed}/${COURSES.length}`,
+      `${u.passed} of ${COURSES.length}`,
       ...courseData,
       now,
     ];
@@ -2237,34 +2257,69 @@ function bindEvents() {
 // ═══════════════════════════════════════════════════
 // DIRECT VIDEO PLAYER ENFORCEMENT
 // ═══════════════════════════════════════════════════
-function initVideoPlayer() {
+async function initVideoPlayer() {
   const video = document.getElementById('course-video');
   if (!video) return;
-  const m = S.activeModule;
+  const m   = S.activeModule;
   const cid = S.activeCourse?.id;
-  const p = currentProg();
+  const uid = S.session.id;
+  const p   = currentProg();
   const isAlreadyWatched = (p[cid]?.watched || []).includes(m?.id);
-  if (isAlreadyWatched) return;
 
   let lastTime  = 0;
   let completed = false;
+  let saveTimer = null;
 
+  // ── Restore saved position (only if not already fully watched) ────────────
+  if (!isAlreadyWatched) {
+    const savedPos = await DB.getVideoPosition(uid, cid, m.id);
+    if (savedPos > 0) {
+      // Wait for enough metadata to seek reliably
+      const restorePos = () => {
+        if (video.duration > 0 && savedPos < video.duration - 2) {
+          video.currentTime = savedPos;
+          lastTime = savedPos;
+          toast('▶ Resuming from where you left off');
+        }
+      };
+      if (video.readyState >= 1) restorePos();
+      else video.addEventListener('loadedmetadata', restorePos, { once: true });
+    }
+  }
+
+  // ── Save position to DB every 10 seconds while playing ───────────────────
+  video.addEventListener('play', () => {
+    if (isAlreadyWatched || completed) return;
+    clearInterval(saveTimer);
+    saveTimer = setInterval(() => {
+      if (!completed && video.currentTime > 0) {
+        DB.saveVideoPosition(uid, cid, m.id, video.currentTime).catch(() => {});
+      }
+    }, 10000);
+  });
+  video.addEventListener('pause',  () => clearInterval(saveTimer));
+  video.addEventListener('ended',  () => clearInterval(saveTimer));
+
+  // ── Anti-skip + completion detection ─────────────────────────────────────
   video.addEventListener('timeupdate', () => {
     const vpf = document.getElementById('vpf');
     if (vpf && video.duration > 0) vpf.style.width = (video.currentTime / video.duration * 100) + '%';
+    if (isAlreadyWatched) return; // already done — allow free seeking
     if (video.currentTime > lastTime + 3) {
       video.currentTime = lastTime;
-      toast('Please watch the video without skipping', 'err');
+      toast('Please watch the video without skipping ⛔', 'err');
     } else {
       lastTime = Math.max(lastTime, video.currentTime);
     }
     if (!completed && video.duration > 0 && video.currentTime >= video.duration - 1) {
       completed = true;
+      clearInterval(saveTimer);
+      DB.clearVideoPosition(uid, cid, m.id).catch(() => {});
       markVideoComplete(m.id, cid);
     }
   });
   video.addEventListener('contextmenu', e => e.preventDefault());
-  video.addEventListener('ratechange', () => { if (video.playbackRate !== 1) video.playbackRate = 1; });
+  video.addEventListener('ratechange',  () => { if (video.playbackRate !== 1) video.playbackRate = 1; });
 }
 
 // Course card click (delegated)
@@ -2286,11 +2341,12 @@ document.addEventListener('drop',     e=>{ if(!e.target.closest('.drop-zone')) e
 // ═══════════════════════════════════════════════════
 // YOUTUBE PLAYER
 // ═══════════════════════════════════════════════════
-function initYouTubePlayer() {
+async function initYouTubePlayer() {
   const wrap = document.getElementById('yt-player-wrap');
   if (!wrap) return;
   const m   = S.activeModule;
   const cid = S.activeCourse?.id;
+  const uid = S.session.id;
   if (!m || !m.ytId) return;
   if (location.protocol === 'file:') return;
 
@@ -2298,12 +2354,19 @@ function initYouTubePlayer() {
   const isAlreadyWatched = (p[cid]?.watched || []).includes(m.id);
   const ytVidId = m.ytId;
 
+  // Load saved position before creating the player
+  const savedPos = isAlreadyWatched ? 0 : await DB.getVideoPosition(uid, cid, m.id);
+
   function createPlayer() {
     if (!document.getElementById('yt-player')) return;
-    let lastTime=0, completed=false, tickTimer=null;
+    let lastTime = savedPos || 0;
+    let completed = false;
+    let tickTimer = null;
+    let saveTimer = null;
 
     function showEmbedError(code) {
       clearInterval(tickTimer);
+      clearInterval(saveTimer);
       const isEmbedBlocked=[101,150,153].includes(code);
       wrap.innerHTML=`<div style="width:100%;min-height:200px;display:flex;align-items:center;justify-content:center;background:#0f0f0f;border-radius:6px;padding:24px;box-sizing:border-box">
         <div style="text-align:center;max-width:340px">
@@ -2319,14 +2382,41 @@ function initYouTubePlayer() {
 
     new YT.Player('yt-player', {
       videoId: ytVidId, width:'100%', height:'100%',
-      playerVars:{rel:0,modestbranding:1,iv_load_policy:3,controls:1,origin:location.origin},
+      playerVars:{
+        rel:0, modestbranding:1, iv_load_policy:3, controls:1,
+        origin:location.origin,
+        // Start at saved position if there is one
+        start: savedPos > 0 ? Math.floor(savedPos) : 0,
+      },
       events:{
-        onError(e){clearInterval(tickTimer);showEmbedError(e.data);},
+        onReady(e) {
+          try{e.target.setPlaybackRate(1);}catch(_){}
+          if (savedPos > 0 && !isAlreadyWatched) {
+            toast('▶ Resuming from where you left off');
+          }
+        },
+        onError(e){clearInterval(tickTimer);clearInterval(saveTimer);showEmbedError(e.data);},
+        onPlaybackRateChange(e){
+          if(e.data !== 1){
+            try{e.target.setPlaybackRate(1);}catch(_){}
+            toast('Playback speed is fixed at 1×','err');
+          }
+        },
         onStateChange(e){
           if(e.data===YT.PlayerState.PLAYING){
             clearInterval(tickTimer);
+            // Save position every 10 seconds
+            if (!isAlreadyWatched && !completed) {
+              clearInterval(saveTimer);
+              saveTimer = setInterval(() => {
+                try {
+                  const cur = e.target.getCurrentTime();
+                  if (cur > 0) DB.saveVideoPosition(uid, cid, m.id, cur).catch(()=>{});
+                } catch(_) {}
+              }, 10000);
+            }
             tickTimer=setInterval(()=>{
-              if(!document.getElementById('yt-player')&&!document.querySelector('iframe#yt-iframe')){clearInterval(tickTimer);return;}
+              if(!document.getElementById('yt-player')&&!document.querySelector('iframe#yt-iframe')){clearInterval(tickTimer);clearInterval(saveTimer);return;}
               let cur,dur;
               try{cur=e.target.getCurrentTime();dur=e.target.getDuration();}catch(_){clearInterval(tickTimer);return;}
               const bar=document.getElementById('yt-vpf');
@@ -2338,13 +2428,26 @@ function initYouTubePlayer() {
                 return;
               }
               lastTime=Math.max(lastTime,cur);
-              if(cur>=dur-2){completed=true;clearInterval(tickTimer);markVideoComplete(m.id,cid);}
+              if(cur>=dur-2){
+                completed=true;
+                clearInterval(tickTimer);
+                clearInterval(saveTimer);
+                DB.clearVideoPosition(uid, cid, m.id).catch(()=>{});
+                markVideoComplete(m.id,cid);
+              }
             },500);
-          } else {clearInterval(tickTimer);}
+          } else {
+            clearInterval(tickTimer);
+            if(e.data !== YT.PlayerState.ENDED) clearInterval(saveTimer);
+          }
           if(e.data===YT.PlayerState.ENDED&&!completed&&!isAlreadyWatched){
+            clearInterval(saveTimer);
             let finalDur=0;try{finalDur=e.target.getDuration();}catch(_){}
             if(finalDur>0&&lastTime>=finalDur-5){
-              completed=true;clearInterval(tickTimer);markVideoComplete(m.id,cid);
+              completed=true;
+              clearInterval(tickTimer);
+              DB.clearVideoPosition(uid, cid, m.id).catch(()=>{});
+              markVideoComplete(m.id,cid);
             } else {
               try{e.target.seekTo(lastTime,true);e.target.playVideo();}catch(_){}
               toast('Please watch the video without skipping ⛔','err');
