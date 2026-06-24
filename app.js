@@ -4,20 +4,106 @@
 const SUPABASE_URL  = 'https://procvnkcvbihsyuthkvv.supabase.co';
 const SUPABASE_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InByb2N2bmtjdmJpaHN5dXRoa3Z2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIxMTM2MTIsImV4cCI6MjA5NzY4OTYxMn0.8sCxhuglrcPkSQ0gGgD4_Cn3-bfa2nchZYxYSDVvh4o';
 
+// ═══════════════════════════════════════════════════
+// AUTH TOKEN STORE
+// Holds the live Supabase JWT. All DB calls use this
+// token instead of the static anon key.
+// ═══════════════════════════════════════════════════
+const Auth = {
+  _token:   null,
+  _refresh: null,
+  _authUid: null,
+
+  // Call after a successful signIn / signUp
+  set(session) {
+    this._token   = session?.access_token  || null;
+    this._refresh = session?.refresh_token || null;
+    this._authUid = session?.user?.id      || null;
+    if (session) {
+      sessionStorage.setItem('trv_sb_token',  this._token);
+      sessionStorage.setItem('trv_sb_refresh', this._refresh);
+      sessionStorage.setItem('trv_sb_uid',     this._authUid);
+    }
+  },
+
+  // Restore from sessionStorage on page load
+  load() {
+    this._token   = sessionStorage.getItem('trv_sb_token');
+    this._refresh = sessionStorage.getItem('trv_sb_refresh');
+    this._authUid = sessionStorage.getItem('trv_sb_uid');
+    return !!this._token;
+  },
+
+  // Wipe on logout
+  clear() {
+    this._token = this._refresh = this._authUid = null;
+    ['trv_sb_token','trv_sb_refresh','trv_sb_uid'].forEach(k => sessionStorage.removeItem(k));
+  },
+
+  // Always use the live JWT; fall back to anon key only if not logged in
+  token() { return this._token || SUPABASE_ANON; },
+};
+
+// ── Supabase Auth API helpers ────────────────────────────────────────────────
+const SBAUTH = {
+  async signIn(email, password) {
+    const r = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+      method: 'POST',
+      headers: { 'apikey': SUPABASE_ANON, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error_description || data.msg || 'Sign-in failed. Check your email and password.');
+    return data; // { access_token, refresh_token, user: { id, email, user_metadata } }
+  },
+
+  async signUp(email, password, name) {
+    const r = await fetch(`${SUPABASE_URL}/auth/v1/signup`, {
+      method: 'POST',
+      headers: { 'apikey': SUPABASE_ANON, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password, data: { role: 'learner', name } }),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error_description || data.msg || 'Registration failed.');
+    return data;
+  },
+
+  async signOut(token) {
+    await fetch(`${SUPABASE_URL}/auth/v1/logout`, {
+      method: 'POST',
+      headers: { 'apikey': SUPABASE_ANON, 'Authorization': 'Bearer ' + token },
+    }).catch(() => {}); // ignore errors — we clear locally regardless
+  },
+
+  async resetPasswordEmail(email) {
+    const r = await fetch(`${SUPABASE_URL}/auth/v1/recover`, {
+      method: 'POST',
+      headers: { 'apikey': SUPABASE_ANON, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email }),
+    });
+    if (!r.ok) { const d = await r.json(); throw new Error(d.msg || 'Failed to send reset email.'); }
+  },
+
+  // Admin-only: update any user's password via the service role isn't possible from
+  // the browser. Instead we use Supabase's admin API through a server function,
+  // OR for now we generate a password-reset email on behalf of the learner.
+  async sendLearnerPasswordReset(email) {
+    return this.resetPasswordEmail(email);
+  },
+};
+
 // ── Supabase REST helper ─────────────────────────────────────────────────────
-// Thin wrapper; no SDK dependency — just fetch().
 const SB = {
   headers(extra={}) {
     return {
       'apikey':        SUPABASE_ANON,
-      'Authorization': 'Bearer ' + SUPABASE_ANON,
+      'Authorization': 'Bearer ' + Auth.token(), // ← live JWT when logged in
       'Content-Type':  'application/json',
       'Prefer':        'return=representation',
       ...extra,
     };
   },
 
-  // GET  /rest/v1/<table>?select=...&col=eq.val
   async select(table, params='') {
     const r = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${params}`, {
       headers: this.headers(),
@@ -26,7 +112,6 @@ const SB = {
     return r.json();
   },
 
-  // POST /rest/v1/<table>  (insert one row → returns array)
   async insert(table, body) {
     const r = await fetch(`${SUPABASE_URL}/rest/v1/${table}`, {
       method:  'POST',
@@ -38,7 +123,6 @@ const SB = {
     return Array.isArray(data) ? data[0] : data;
   },
 
-  // PATCH /rest/v1/<table>?col=eq.val
   async update(table, params, body) {
     const r = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${params}`, {
       method:  'PATCH',
@@ -50,7 +134,6 @@ const SB = {
     return Array.isArray(data) ? data[0] : data;
   },
 
-  // DELETE /rest/v1/<table>?col=eq.val
   async delete(table, params) {
     const r = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${params}`, {
       method:  'DELETE',
@@ -59,7 +142,6 @@ const SB = {
     if (!r.ok) throw new Error(await r.text());
   },
 
-  // Upsert: insert or update on conflict
   async upsert(table, body, onConflict) {
     const r = await fetch(
       `${SUPABASE_URL}/rest/v1/${table}?on_conflict=${onConflict}`,
@@ -74,8 +156,6 @@ const SB = {
     return Array.isArray(data) ? data[0] : data;
   },
 
-  // ── Storage: upload a file to a Supabase bucket ───────────────────────────
-  // bucket: 'pdfs'  |  path: '<moduleId>.pdf'
   async uploadFile(bucket, path, blob, contentType) {
     const r = await fetch(
       `${SUPABASE_URL}/storage/v1/object/${bucket}/${path}`,
@@ -83,14 +163,13 @@ const SB = {
         method:  'POST',
         headers: {
           'apikey':        SUPABASE_ANON,
-          'Authorization': 'Bearer ' + SUPABASE_ANON,
+          'Authorization': 'Bearer ' + Auth.token(),
           'Content-Type':  contentType,
         },
         body: blob,
       }
     );
     if (!r.ok) {
-      // 409 = already exists → use PUT (upsert)
       if (r.status === 409) return this.updateFile(bucket, path, blob, contentType);
       throw new Error(await r.text());
     }
@@ -104,7 +183,7 @@ const SB = {
         method:  'PUT',
         headers: {
           'apikey':        SUPABASE_ANON,
-          'Authorization': 'Bearer ' + SUPABASE_ANON,
+          'Authorization': 'Bearer ' + Auth.token(),
           'Content-Type':  contentType,
         },
         body: blob,
@@ -114,35 +193,29 @@ const SB = {
     return r.json();
   },
 
-  // Public URL for a storage object
   publicUrl(bucket, path) {
     return `${SUPABASE_URL}/storage/v1/object/public/${bucket}/${path}`;
   },
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DATABASE ABSTRACTION — aligned to actual Supabase schema:
+// DATABASE ABSTRACTION
 //
-//   learners  (id uuid PK, name, email, subject, notes, disabled, created_at,
-//              + auth data stored in a separate jsonb column via progress table)
-//              NOTE: pw, sq, sa are stored in progress table under course_id='__auth'
-//              because the learners table has no auth columns.
+//   learners  (id uuid PK, auth_id uuid FK→auth.users, name, email,
+//              subject, notes, disabled, created_at)
 //   courses   (id text PK, data jsonb, updated_at timestamptz)
 //   progress  (learner_id uuid, course_id text, data jsonb, PK: learner_id+course_id)
-//              course_id='__auth'    → { pw, sq, sa }
 //              course_id='__meta'    → { streak, last_date, retakes:{}, quiz_answers:{} }
 //              course_id=<actual id> → { watched:[], quizScore, moduleQuiz:{} }
 //   settings  (id integer PK, data jsonb)
 // ─────────────────────────────────────────────────────────────────────────────
 const DB = {
-  // ── In-memory caches ───────────────────────────────────────────────────────
   _learners: null,
   _courses:  null,
-  _progMap:  {},   // { [learnerId]: { [courseId]: data } }
+  _progMap:  {},
   _settings: null,
 
   // ── LEARNERS ───────────────────────────────────────────────────────────────
-  // Returns learner rows. Auth fields (pw/sq/sa) are fetched separately via _auth().
   async learners() {
     if (this._learners) return this._learners;
     const rows = await SB.select('learners', 'select=*&order=created_at.asc');
@@ -150,53 +223,26 @@ const DB = {
     return rows;
   },
 
-  // Convenience: return learners with auth data merged in (for login/reset)
+  // Returns learners with dept alias (subject→dept) for compatibility with
+  // existing render/stats code. No auth fields needed — they live in Supabase Auth.
   async learnersWithAuth() {
     const rows = await this.learners();
-    return Promise.all(rows.map(async r => {
-      const auth = await this._auth(r.id);
-      return { ...r, pw: auth.pw||'', sq: auth.sq||'', sa: auth.sa||'',
-               dept: r.subject||'' }; // alias subject→dept for legacy code
-    }));
+    return rows.map(r => ({ ...r, dept: r.subject || '' }));
   },
 
-  // Get/set auth blob for a learner (stored in progress, course_id='__auth')
-  async _auth(learnerId) {
-    try {
-      const rows = await SB.select('progress',
-        `select=data&learner_id=eq.${learnerId}&course_id=eq.__auth`);
-      return rows.length ? (rows[0].data || {}) : {};
-    } catch { return {}; }
-  },
-  async _saveAuth(learnerId, authData) {
-    await SB.upsert('progress',
-      { learner_id: learnerId, course_id: '__auth', data: authData },
-      'learner_id,course_id');
-  },
-
-  // Save a learner row. Splits out pw/sq/sa into the __auth progress row.
+  // Save a learner row (no pw/sq/sa — those are gone).
   async saveLearner(u) {
-    const { pw, sq, sa, dept, ...rest } = u;
-    // Map dept back to subject
+    const { dept, ...rest } = u;
     const row = { ...rest, subject: dept || rest.subject || '' };
-    // Remove non-schema fields
     delete row.dept;
+    // Remove any legacy auth fields that may have come in
+    delete row.pw; delete row.sq; delete row.sa;
     await SB.upsert('learners', row, 'id');
-    // Persist auth separately
-    if (pw !== undefined || sq !== undefined || sa !== undefined) {
-      const existing = await this._auth(u.id);
-      await this._saveAuth(u.id, {
-        pw:  pw  !== undefined ? pw  : existing.pw  || '',
-        sq:  sq  !== undefined ? sq  : existing.sq  || '',
-        sa:  sa  !== undefined ? sa  : existing.sa  || '',
-      });
-    }
     this._learners = null;
   },
 
   async deleteLearner(id) {
     await SB.delete('learners', `id=eq.${id}`);
-    // Cascade: delete all progress rows for this learner
     await SB.delete('progress', `learner_id=eq.${id}`);
     this._learners = null;
     delete this._progMap[id];
@@ -220,14 +266,13 @@ const DB = {
   },
 
   // ── PROGRESS ───────────────────────────────────────────────────────────────
-  // Returns { [courseId]: data } — excludes __auth and __meta internal rows.
   async prog(learnerId) {
     if (this._progMap[learnerId]) return this._progMap[learnerId];
     const rows = await SB.select('progress',
       `select=course_id,data&learner_id=eq.${learnerId}`);
     const map = {};
     for (const r of rows) {
-      if (r.course_id !== '__auth' && r.course_id !== '__meta') {
+      if (r.course_id !== '__meta') {
         map[r.course_id] = r.data;
       }
     }
@@ -242,11 +287,10 @@ const DB = {
     this._progMap[learnerId][courseId] = data;
   },
   async resetProg(learnerId) {
-    // Delete only real course progress, preserve __auth
     const rows = await SB.select('progress',
       `select=course_id&learner_id=eq.${learnerId}`);
     for (const r of rows) {
-      if (r.course_id !== '__auth') {
+      if (r.course_id !== '__meta') {
         await SB.delete('progress',
           `learner_id=eq.${learnerId}&course_id=eq.${r.course_id}`);
       }
@@ -254,7 +298,7 @@ const DB = {
     this._progMap[learnerId] = {};
   },
 
-  // ── META (streaks + retakes + quiz_answers — stored in progress __meta) ────
+  // ── META (streaks + retakes + quiz_answers) ────────────────────────────────
   async _meta(learnerId) {
     try {
       const rows = await SB.select('progress',
@@ -320,7 +364,7 @@ const DB = {
     this._settings = data;
   },
 
-  // ── SESSION (sessionStorage only — no DB round-trip) ──────────────────────
+  // ── SESSION (app-level, stored in sessionStorage) ──────────────────────────
   session()      { try { return JSON.parse(sessionStorage.getItem('trv_sess')||'null'); } catch { return null; } },
   saveSession(s) { sessionStorage.setItem('trv_sess', JSON.stringify(s)); },
   clearSession() { sessionStorage.removeItem('trv_sess'); },
@@ -329,9 +373,6 @@ const DB = {
 // ═══════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════
-const ADMIN_EMAIL = 'admin@trivekii.com';
-const ADMIN_PW    = 'Admin@123';
-
 const DEFAULT_COURSES = [
   { id:'c1', title:'Sample Course', cat:'General', catClass:'badge-blue',
     modules:[
@@ -359,7 +400,7 @@ const DEFAULT_COURSES = [
 const DEFAULT_SETTINGS = { passThreshold: 80, maxRetakes: 2 };
 
 // ═══════════════════════════════════════════════════
-// GLOBALS (populated async on boot)
+// GLOBALS
 // ═══════════════════════════════════════════════════
 let COURSES  = [];
 let SETTINGS = { ...DEFAULT_SETTINGS };
@@ -377,12 +418,11 @@ let S = {
   authMode:     'login',
   adminSubTab:  'info',
   videoWatched: {},
-  _pdfUrl:      null,   // object-URL for a PDF loaded from Supabase storage
+  _pdfUrl:      null,
   _ytId:        null,
   _contentTab:  null,
-  // Async user/progress caches used during a rendered page
   _allUsers:    null,
-  _allProg:     {},     // { [uid]: progMap }
+  _allProg:     {},
 };
 
 // ═══════════════════════════════════════════════════
@@ -467,7 +507,7 @@ function toast(msg, type='ok') {
 function quizKey(cid, mid) { return mid ? cid+'_mod_'+mid : cid; }
 
 // ═══════════════════════════════════════════════════
-// AUTH
+// AUTH SCREEN
 // ═══════════════════════════════════════════════════
 const authScreen = document.getElementById('auth-screen');
 const appScreen  = document.getElementById('app-screen');
@@ -478,139 +518,120 @@ function showMsg(html, type='err') {
 
 function setAuthMode(mode) {
   S.authMode = mode;
-  const isLogin    = mode==='login';
-  const isRegister = mode==='register';
-  const isReset    = mode==='reset' || mode==='reset-answer' || mode==='reset-pw';
-  document.getElementById('auth-title').textContent      = isLogin?'Welcome back':isRegister?'Create account':'Reset password';
-  document.getElementById('auth-subtitle').textContent   = isLogin?'Sign in to your Trivekii account':isRegister?'Register as a learner to get started':'We\'ll verify your identity first';
-  document.getElementById('auth-submit-btn').textContent = isLogin?'Sign in →':isRegister?'Create account →':mode==='reset'?'Find my account →':mode==='reset-answer'?'Verify answer →':'Set new password →';
-  document.getElementById('auth-switch-text').textContent= isLogin?"Don't have an account?":isRegister?'Already have an account?':'Remember your password?';
-  document.getElementById('auth-toggle').textContent     = isLogin?' Register here':isRegister?' Sign in':' Sign in';
-  document.getElementById('field-name').style.display    = isRegister?'':'none';
-  document.getElementById('field-pw2').style.display     = isRegister||mode==='reset-pw'?'':'none';
-  document.getElementById('field-sq').style.display      = isRegister?'':'none';
-  document.getElementById('field-sa').style.display      = isRegister||mode==='reset-answer'?'':'none';
-  document.getElementById('inp-email').closest('.field').style.display = mode==='reset-answer'||mode==='reset-pw'?'none':'';
-  document.getElementById('inp-pw').closest('.field').style.display    = mode==='reset'||mode==='reset-answer'?'none':'';
-  document.getElementById('forgot-row').style.display = isLogin?'':'none';
+  const isLogin    = mode === 'login';
+  const isRegister = mode === 'register';
+  const isReset    = mode === 'reset';
+
+  document.getElementById('auth-title').textContent =
+    isLogin ? 'Welcome back' : isRegister ? 'Create account' : 'Reset password';
+  document.getElementById('auth-subtitle').textContent =
+    isLogin    ? 'Sign in to your Trivekii account' :
+    isRegister ? 'Register as a learner to get started' :
+                 'Enter your email and we\'ll send a reset link';
+  document.getElementById('auth-submit-btn').textContent =
+    isLogin ? 'Sign in →' : isRegister ? 'Create account →' : 'Send reset link →';
+  document.getElementById('auth-switch-text').textContent =
+    isLogin ? "Don't have an account?" : isRegister ? 'Already have an account?' : 'Remember your password?';
+  document.getElementById('auth-toggle').textContent =
+    isLogin ? ' Register here' : ' Sign in';
+
+  // Show/hide fields
+  document.getElementById('field-name').style.display  = isRegister ? '' : 'none';
+  document.getElementById('field-pw2').style.display   = isRegister ? '' : 'none';
+  document.getElementById('field-sq').style.display    = 'none'; // no longer used
+  document.getElementById('field-sa').style.display    = 'none'; // no longer used
+  document.getElementById('inp-pw').closest('.field').style.display  = isReset ? 'none' : '';
+  document.getElementById('forgot-row').style.display  = isLogin ? '' : 'none';
   document.getElementById('auth-msg').innerHTML = '';
 }
 
-document.getElementById('auth-toggle').addEventListener('click',()=>{
-  if(S.authMode==='login') setAuthMode('register');
-  else setAuthMode('login');
+document.getElementById('auth-toggle').addEventListener('click', () => {
+  setAuthMode(S.authMode === 'login' ? 'register' : 'login');
 });
-document.getElementById('forgot-link').addEventListener('click',()=>setAuthMode('reset'));
+document.getElementById('forgot-link').addEventListener('click', () => setAuthMode('reset'));
 document.getElementById('auth-submit-btn').addEventListener('click', doAuth);
-document.addEventListener('keydown', e=>{if(e.key==='Enter'&&authScreen.style.display!=='none')doAuth();});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && authScreen.style.display !== 'none') doAuth();
+});
 
 async function doAuth() {
   const email = document.getElementById('inp-email').value.trim().toLowerCase();
   const pw    = document.getElementById('inp-pw').value;
   const btn   = document.getElementById('auth-submit-btn');
-  document.getElementById('auth-msg').innerHTML='';
-
+  document.getElementById('auth-msg').innerHTML = '';
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span>';
 
   try {
-    // ── LOGIN ──
-    if (S.authMode==='login') {
-      const adminPw = sessionStorage.getItem('trv_admin_pw_override') || ADMIN_PW;
-      if (email===ADMIN_EMAIL && pw===adminPw) {
-        await boot({role:'admin', email, name:'Admin', id:'admin'});
+    // ── LOGIN ──────────────────────────────────────────────────────────────
+    if (S.authMode === 'login') {
+      const sbSession = await SBAUTH.signIn(email, pw);
+      Auth.set(sbSession);
+
+      const meta = sbSession.user.user_metadata || {};
+      const role = meta.role || 'learner';
+      const name = meta.name || email;
+      const authUid = sbSession.user.id;
+
+      if (role === 'admin') {
+        await boot({ role: 'admin', email, name, id: 'admin', authUid });
       } else {
-        const users = await DB.learnersWithAuth();
-        const u = users.find(x=>x.email===email && x.pw===pw);
-        if (!u) { showMsg('Incorrect email or password.'); return; }
-        if (u.disabled) { showMsg('This account has been disabled. Contact your administrator.'); return; }
-        await boot({role:'learner', email:u.email, name:u.name, id:u.id});
+        // Fetch the learners row that was linked to this auth user
+        const rows = await SB.select('learners', `select=*&auth_id=eq.${authUid}`);
+        if (!rows.length) {
+          Auth.clear();
+          throw new Error('No learner profile found for this account. Please contact your administrator.');
+        }
+        const u = rows[0];
+        if (u.disabled) {
+          Auth.clear();
+          throw new Error('This account has been disabled. Please contact your administrator.');
+        }
+        await boot({ role: 'learner', email: u.email, name: u.name, id: u.id, authUid });
       }
 
-    // ── REGISTER ──
-    } else if (S.authMode==='register') {
+    // ── REGISTER ────────────────────────────────────────────────────────────
+    } else if (S.authMode === 'register') {
       const name = document.getElementById('inp-name').value.trim();
       const pw2  = document.getElementById('inp-pw2').value;
-      const sq   = document.getElementById('inp-sq').value;
-      const sa   = document.getElementById('inp-sa').value.trim();
+
       if (!name)                { showMsg('Please enter your full name.'); return; }
-      if (!email.includes('@')) { showMsg('Please enter a valid email.'); return; }
-      if (pw.length<6)          { showMsg('Password must be at least 6 characters.'); return; }
-      if (pw!==pw2)             { showMsg('Passwords do not match.'); return; }
-      if (!sq)                  { showMsg('Please choose a security question.'); return; }
-      if (!sa)                  { showMsg('Please provide your security answer.'); return; }
-      const users = await DB.learnersWithAuth();
-      if (users.find(x=>x.email===email)) { showMsg('This email is already registered.'); return; }
-      const nu = {
-        id: crypto.randomUUID(), name, email, pw, sq,
-        sa: sa.toLowerCase().trim(),
-        created_at: new Date().toISOString(), disabled: false, subject: '', notes: '',
-      };
-      await DB.saveLearner(nu);
-      showMsg('Account created! You can now sign in.','ok');
+      if (!email.includes('@')) { showMsg('Please enter a valid email address.'); return; }
+      if (pw.length < 6)        { showMsg('Password must be at least 6 characters.'); return; }
+      if (pw !== pw2)           { showMsg('Passwords do not match.'); return; }
+
+      // 1. Create the Supabase Auth user
+      const sbSession = await SBAUTH.signUp(email, pw, name);
+      const authUid = sbSession.user?.id;
+      if (!authUid) throw new Error('Registration failed — please try again.');
+
+      // 2. Set the JWT so the next DB call is authenticated
+      Auth.set(sbSession);
+
+      // 3. Insert the learners row linked to the new auth user
+      await SB.insert('learners', {
+        id:         crypto.randomUUID(),
+        auth_id:    authUid,
+        name,
+        email,
+        created_at: new Date().toISOString(),
+        disabled:   false,
+        subject:    '',
+        notes:      '',
+      });
+
+      showMsg('Account created! You can now sign in.', 'ok');
+      Auth.clear(); // clear so they sign in fresh
       setAuthMode('login');
       document.getElementById('inp-email').value = email;
+      document.getElementById('inp-pw').value    = '';
 
-    // ── RESET STEP 1 ──
-    } else if (S.authMode==='reset') {
+    // ── FORGOT PASSWORD ──────────────────────────────────────────────────────
+    } else if (S.authMode === 'reset') {
       if (!email) { showMsg('Please enter your email address.'); return; }
-      if (email===ADMIN_EMAIL) {
-        S._resetEmail = email;
-        S._resetIsAdmin = true;
-        setAuthMode('reset-answer');
-        document.getElementById('field-sa').querySelector('label').textContent = 'Admin PIN (set in Settings)';
-        document.getElementById('field-sa').querySelector('input').placeholder = 'Enter your admin PIN';
-        showMsg('Enter your admin PIN to reset the admin password.','ok');
-        return;
-      }
-      const users = await DB.learnersWithAuth();
-      const u = users.find(x=>x.email===email);
-      if (!u) { showMsg('No account found with that email address.'); return; }
-      if (!u.sq || !u.sa) { showMsg('This account has no security question set. Please contact your administrator.'); return; }
-      S._resetEmail = email;
-      S._resetIsAdmin = false;
-      setAuthMode('reset-answer');
-      const sqMap = {pet:"What was the name of your first pet?",city:"What city were you born in?",mother:"What is your mother's maiden name?",school:"What was the name of your primary school?",friend:"What is the name of your childhood best friend?"};
-      const saField = document.getElementById('field-sa');
-      saField.querySelector('label').innerHTML = `Security question: <strong>${sqMap[u.sq]||u.sq}</strong>`;
-      saField.querySelector('input').placeholder = 'Your answer';
-      saField.querySelector('input').value = '';
-
-    // ── RESET STEP 2 ──
-    } else if (S.authMode==='reset-answer') {
-      const answer = document.getElementById('inp-sa').value.trim().toLowerCase();
-      if (!answer) { showMsg('Please enter your answer.'); return; }
-      if (S._resetIsAdmin) {
-        const storedPin = sessionStorage.getItem('trv_admin_pin') || localStorage.getItem('trv_admin_pin') || '';
-        if (!storedPin) { showMsg('No admin PIN has been set. Please set one in Settings first.'); return; }
-        if (answer !== storedPin) { showMsg('Incorrect PIN. Try again.'); return; }
-      } else {
-        const users = await DB.learnersWithAuth();
-        const u = users.find(x=>x.email===S._resetEmail);
-        if (!u) { showMsg('Account not found.'); return; }
-        if (answer !== u.sa) { showMsg('Incorrect answer. Please try again.'); return; }
-      }
-      setAuthMode('reset-pw');
-      showMsg('Identity verified! Set your new password below.','ok');
-
-    // ── RESET STEP 3 ──
-    } else if (S.authMode==='reset-pw') {
-      const pw2 = document.getElementById('inp-pw2').value;
-      if (pw.length<6)  { showMsg('Password must be at least 6 characters.'); return; }
-      if (pw!==pw2)     { showMsg('Passwords do not match.'); return; }
-      if (S._resetIsAdmin) {
-        sessionStorage.setItem('trv_admin_pw_override', pw);
-        localStorage.setItem('trv_admin_pw_override', pw);
-        showMsg('Admin password updated! You can now sign in.','ok');
-      } else {
-        const users = await DB.learnersWithAuth();
-        const u = users.find(x=>x.email===S._resetEmail);
-        if (!u) { showMsg('Account not found.'); return; }
-        await DB.saveLearner({...u, pw});
-        showMsg('Password updated! You can now sign in.','ok');
-      }
-      S._resetEmail = null; S._resetIsAdmin = false;
-      setTimeout(()=>setAuthMode('login'), 1500);
+      await SBAUTH.resetPasswordEmail(email);
+      showMsg('If that email is registered, a password reset link has been sent. Check your inbox.', 'ok');
+      setTimeout(() => setAuthMode('login'), 4000);
     }
 
   } catch(err) {
@@ -618,27 +639,24 @@ async function doAuth() {
     console.error(err);
   } finally {
     btn.disabled = false;
-    // Restore correct label
-    const labels = {login:'Sign in →',register:'Create account →',reset:'Find my account →','reset-answer':'Verify answer →','reset-pw':'Set new password →'};
+    const labels = { login: 'Sign in →', register: 'Create account →', reset: 'Send reset link →' };
     btn.textContent = labels[S.authMode] || 'Submit';
   }
 }
 
-// ─── Boot: load all remote data then render ─────────────────────────────────
+// ─── Boot: load all remote data then render ──────────────────────────────────
 async function boot(session) {
   S.session = session;
   DB.saveSession(session);
 
   showLoadingOverlay('Loading your workspace…');
   try {
-    // Load courses + settings in parallel
     const [remoteCourses, remoteSettings] = await Promise.all([
       DB.courses(),
       DB.settings(),
     ]);
 
     if (!remoteCourses.length) {
-      // Seed default courses on first run
       for (const c of DEFAULT_COURSES) await DB.saveCourse(c);
       COURSES = DEFAULT_COURSES.slice();
     } else {
@@ -648,12 +666,13 @@ async function boot(session) {
     SETTINGS = remoteSettings || DEFAULT_SETTINGS;
     if (!remoteSettings) await DB.saveSettings(SETTINGS);
 
-    // Pre-load current user's progress
     if (session.role === 'learner') {
       const p = await DB.prog(session.id);
       S._allProg[session.id] = p;
+      // Load streak
+      const streakRow = await DB.getStreak(session.id);
+      S._streak = streakRow.streak || 0;
     } else {
-      // Admin: pre-load all users' progress for stats
       await refreshAllStats();
     }
 
@@ -686,35 +705,36 @@ function launch(session) {
   appScreen.style.display  = 'flex';
   document.getElementById('nav-username').textContent = session.name;
   document.getElementById('nav-avatar').textContent   = session.name[0].toUpperCase();
-  if (session.role==='admin') {
+  if (session.role === 'admin') {
     document.getElementById('topnav').classList.add('admin-nav');
     document.getElementById('nav-role-badge').style.display = 'inline';
   }
   buildSidebar(); render();
 }
 
-document.getElementById('logout-btn').addEventListener('click',()=>{
+document.getElementById('logout-btn').addEventListener('click', async () => {
+  await SBAUTH.signOut(Auth.token());
+  Auth.clear();
   DB.clearSession();
-  // Revoke any object URLs
   if (S._pdfUrl && S._pdfUrl.startsWith('blob:')) URL.revokeObjectURL(S._pdfUrl);
-  S = {session:null,tab:'dashboard',activeCourse:null,activeModule:null,quiz:null,selectedUser:null,authMode:'login',adminSubTab:'info',videoWatched:{},_pdfUrl:null,_videoUrl:null,_ytId:null,_contentTab:null,_allUsers:null,_allProg:{}};
+  S = {session:null,tab:'dashboard',activeCourse:null,activeModule:null,quiz:null,
+       selectedUser:null,authMode:'login',adminSubTab:'info',videoWatched:{},
+       _pdfUrl:null,_videoUrl:null,_ytId:null,_contentTab:null,_allUsers:null,_allProg:{}};
   COURSES = []; SETTINGS = {...DEFAULT_SETTINGS};
-  // Reset DB caches
-  DB._users=null; DB._courses=null; DB._progMap={}; DB._settings=null;
+  DB._learners=null; DB._courses=null; DB._progMap={}; DB._settings=null;
   appScreen.style.display  = 'none';
   authScreen.style.display = 'grid';
   document.getElementById('topnav').classList.remove('admin-nav');
   document.getElementById('nav-role-badge').style.display = 'none';
   document.getElementById('auth-msg').innerHTML = '';
   document.getElementById('inp-email').value = '';
-  document.getElementById('inp-pw').value = '';
+  document.getElementById('inp-pw').value    = '';
 });
 
-// ─── Admin: load all users + their progress for stats ───────────────────────
+// ─── Admin: load all users + progress for stats ──────────────────────────────
 async function refreshAllStats() {
   const users = await DB.learnersWithAuth();
   S._allUsers = users;
-  // Load all progress in parallel
   await Promise.all(users.map(async u => {
     const p = await DB.prog(u.id);
     S._allProg[u.id] = p;
@@ -777,7 +797,6 @@ function render() {
 }
 
 async function loadAndRender(preferredTab) {
-  // Revoke previous object URLs to avoid memory leaks
   if (S._pdfUrl   && S._pdfUrl.startsWith('blob:'))   URL.revokeObjectURL(S._pdfUrl);
   S._pdfUrl = null; S._videoUrl = null; S._ytId = null; S._contentTab = null;
 
@@ -785,7 +804,6 @@ async function loadAndRender(preferredTab) {
     const m = S.activeModule;
     if (m.ytId) S._ytId = m.ytId;
 
-    // Video: use public Supabase storage URL directly (stream without blob)
     if (m.video) {
       try {
         const videoUrl = SB.publicUrl('videos', m.id + '.mp4');
@@ -794,7 +812,6 @@ async function loadAndRender(preferredTab) {
       } catch(e) { console.warn('Video fetch failed', e); }
     }
 
-    // PDF: fetch as blob so iframe src works cross-origin
     if (m.pdf) {
       try {
         const pdfUrl = SB.publicUrl('pdfs', m.id + '.pdf');
@@ -901,22 +918,17 @@ function renderCourseList() {
   const uid=S.session.id; const p=currentProg();
   return `<div class="fade">
     <h1 class="page-title">My Courses</h1>
-    <p class="page-sub">Click a course to start or continue learning.</p>
+    <p class="page-sub">Select a course to begin or continue learning.</p>
     <div class="course-grid">
       ${COURSES.map(c=>{
-        const pct=calcCourseProg(uid,c.id);const sc=p[c.id]?.quizScore;const allW=pct===100;
-        const passed=sc!=null&&sc>=SETTINGS.passThreshold;
+        const pct=calcCourseProg(uid,c.id);
+        const passed=isCoursePassed(uid,c.id,p);
         return `<div class="course-card" data-cid="${c.id}">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
-            <span class="badge ${c.catClass}">${esc(c.cat)}</span>
-            ${passed?`<span class="badge badge-green">✓ Passed</span>`:
-              sc!=null?`<span class="badge badge-orange">Quiz: ${sc}%</span>`:
-              allW?`<span style="font-size:11px;color:var(--accent);font-weight:600">Take quiz →</span>`:''}
-          </div>
+          <span class="badge ${c.catClass}" style="margin-bottom:8px;display:inline-block">${esc(c.cat)}</span>
           <p style="font-family:'Syne',sans-serif;font-weight:700;font-size:17px;margin-bottom:6px">${esc(c.title)}</p>
-          <p style="font-size:12px;color:var(--muted);margin-bottom:14px">${c.modules.length} modules · ${(c.quiz?c.quiz.length:0)} final quiz Qs</p>
-          <div class="prog-bg"><div class="prog-fill" style="width:${pct}%;background:var(--accent)"></div></div>
-          <p style="font-size:11px;color:var(--muted);margin-top:6px">${pct}% complete</p>
+          <p style="font-size:12px;color:var(--muted);margin-bottom:14px">${c.modules.length} modules</p>
+          <div class="prog-bg" style="margin-bottom:6px"><div class="prog-fill" style="width:${pct}%;background:${passed?'var(--success)':'var(--accent)'}"></div></div>
+          <p style="font-size:11px;color:var(--muted)">${passed?'✓ Completed':pct>0?pct+'% complete':'Not started'}</p>
         </div>`;
       }).join('')}
     </div>
@@ -924,138 +936,79 @@ function renderCourseList() {
 }
 
 function renderCoursePlayer() {
-  const c=S.activeCourse; const uid=S.session.id;
-  const m=S.activeModule||c.modules[0];
-  const p=currentProg(); const pct=calcCourseProg(uid,c.id);
-  const allW=pct===100; const sc=p[c.id]?.quizScore;
-  const watched=(p[c.id]?.watched||[]);
-  const isWatched=watched.includes(m.id);
+  const c=S.activeCourse; const uid=S.session.id; const p=currentProg();
+  const m=S.activeModule;
+  if(!m) return `<div class="fade"><button class="btn-ghost btn-sm" id="back-btn">← Back</button></div>`;
+  const isWatched=(p[c.id]?.watched||[]).includes(m.id);
+  const modIndex=c.modules.findIndex(x=>x.id===m.id);
+  const unlocked=isModuleUnlocked(uid,c.id,modIndex,p);
+  const hasQuiz=m.quiz&&m.quiz.length>0;
+  const modScore=getModuleQuizScore(uid,c.id,m.id,p);
+  const modPassed=modScore!=null&&modScore>=SETTINGS.passThreshold;
 
-  const hasVideo = !!S._videoUrl;
-  const hasPdf   = !!S._pdfUrl;
-  const hasYt    = !!S._ytId;
-  const sources = [];
-  if (hasVideo) sources.push({key:'video',   label:'🎬 Video'});
-  if (hasYt)    sources.push({key:'youtube', label:'▶ YouTube'});
-  if (hasPdf)   sources.push({key:'pdf',     label:'📄 PDF'});
-  let activeTab = S._contentTab;
-  if (!activeTab || !sources.find(s=>s.key===activeTab)) activeTab = sources[0]?.key || null;
+  const avail=[];
+  if(S._videoUrl) avail.push({k:'video',label:'🎬 Video'});
+  if(m.ytId)      avail.push({k:'youtube',label:'▶ YouTube'});
+  if(S._pdfUrl)   avail.push({k:'pdf',label:'📄 PDF'});
+  const activeTab=S._contentTab||(avail[0]?.k)||null;
 
-  let tabsBlock = '';
-  if (sources.length > 1) {
-    tabsBlock = `<div style="display:flex;gap:6px;margin-bottom:10px">
-      ${sources.map(s=>`<button class="content-tab-btn btn-ghost btn-sm" data-tab="${s.key}"
-        style="${activeTab===s.key?'border-color:var(--accent);color:var(--accent);font-weight:600':''}">${s.label}</button>`).join('')}
-    </div>`;
-  }
-
-  let mediaBlock = tabsBlock;
-  if (!sources.length) {
-    mediaBlock += `<div class="video-wrapper" style="background:#1a1a2e;display:flex;align-items:center;justify-content:center">
-      <div style="text-align:center">
-        <div style="font-size:48px;margin-bottom:12px">📭</div>
-        <p style="color:rgba(255,255,255,0.6);font-size:13px">${esc(m.title)}</p>
-        <p style="color:rgba(255,255,255,0.35);font-size:11px;margin-top:4px">No content uploaded yet</p>
-      </div>
-    </div>`;
-  } else if (activeTab==='video') {
-    mediaBlock += `<div class="video-wrapper">
-      <video id="course-video" src="${S._videoUrl}" controls controlsList="nodownload nofullscreen" disablePictureInPicture
-        style="width:100%;height:100%"></video>
-      <div class="video-progress-bar"><div class="video-progress-fill" id="vpf" style="width:0%"></div></div>
-    </div>
-    <div style="display:flex;gap:10px;align-items:center;margin-bottom:12px">
-      <span style="font-size:12px;color:var(--muted)">🎬 Watch the full video to continue — skipping is not allowed.</span>
-    </div>`;
-  } else if (activeTab==='pdf') {
-    mediaBlock += `<div class="pdf-wrapper">
-      <iframe src="${S._pdfUrl}" title="${esc(m.title)}"></iframe>
-    </div>
-    <div style="display:flex;gap:10px;align-items:center;margin-bottom:12px">
-      <span style="font-size:12px;color:var(--muted)">📄 PDF — scroll through it, then mark the module complete below.</span>
-    </div>`;
-  } else if (activeTab==='youtube') {
-    const isFileProtocol = location.protocol === 'file:';
-    if (isFileProtocol) {
-      mediaBlock += `<div class="video-wrapper" style="background:#0f0f0f;display:flex;align-items:center;justify-content:center">
-        <div style="text-align:center;padding:32px;max-width:380px">
-          <div style="font-size:44px;margin-bottom:14px">🌐</div>
-          <p style="color:#fff;font-weight:700;font-size:15px;margin-bottom:10px">YouTube requires a web server</p>
-          <p style="color:rgba(255,255,255,0.55);font-size:12px;line-height:1.6;margin-bottom:20px">Serve the app over HTTP (e.g. <code>npx serve .</code>) to enable embedded YouTube videos.</p>
-          <a href="https://www.youtube.com/watch?v=${esc(S._ytId)}" target="_blank" rel="noopener noreferrer"
-             style="display:inline-block;padding:9px 20px;background:#FF0000;color:#fff;border-radius:6px;font-size:13px;font-weight:600;text-decoration:none">
-            Watch on YouTube instead ↗
-          </a>
-        </div>
-      </div>`;
-    } else {
-      mediaBlock += `<div class="video-wrapper" style="position:relative;background:#000">
-        <div id="yt-player-wrap" style="width:100%;height:100%;position:relative">
-          <div id="yt-player"></div>
-        </div>
-        <div class="video-progress-bar"><div class="video-progress-fill" id="yt-vpf" style="width:0%"></div></div>
-      </div>
-      <div style="display:flex;gap:10px;align-items:center;margin-bottom:12px">
-        <span style="font-size:12px;color:var(--muted)">▶ Watch the full YouTube video to continue — skipping is not allowed.</span>
-      </div>`;
+  let contentHtml='';
+  if(!unlocked){
+    contentHtml=`<div class="video-wrapper"><div class="video-placeholder"><div class="video-lock-msg"><p style="color:#fff;font-weight:600;font-size:15px;margin-bottom:6px">🔒 Module locked</p><p style="color:rgba(255,255,255,0.5);font-size:13px">Complete the previous module to unlock this one.</p></div></div></div>`;
+  } else if(avail.length>0){
+    const tabBar=avail.length>1?`<div class="tab-bar" style="margin-bottom:14px">${avail.map(a=>`<button class="tab-btn content-tab-btn${activeTab===a.k?' active':''}" data-tab="${a.k}">${a.label}</button>`).join('')}</div>`:'';
+    if(activeTab==='video'&&S._videoUrl){
+      contentHtml=tabBar+`<div class="video-wrapper"><video id="course-video" src="${S._videoUrl}" controls controlsList="nodownload" playsinline style="width:100%;height:100%"></video><div class="video-progress-bar"><div class="video-progress-fill" id="vpf" style="width:0%"></div></div></div>`;
+    } else if(activeTab==='youtube'&&m.ytId){
+      contentHtml=tabBar+`<div class="video-wrapper" id="yt-player-wrap"><div id="yt-player" style="width:100%;height:100%"></div><div class="video-progress-bar"><div class="video-progress-fill" id="yt-vpf" style="width:0%"></div></div></div>`;
+    } else if(activeTab==='pdf'&&S._pdfUrl){
+      contentHtml=tabBar+`<div class="pdf-wrapper"><iframe src="${S._pdfUrl}" title="Module PDF"></iframe></div>`;
     }
+  } else {
+    contentHtml=`<div class="card" style="background:rgba(10,10,15,0.03);text-align:center;padding:32px"><p style="font-size:14px;color:var(--muted)">No media content for this module.</p></div>`;
   }
+
+  const allModsDone=allModulesComplete(uid,c.id,p);
+  const sc=p[c.id]?.quizScore;
+  const coursePassed=isCoursePassed(uid,c.id,p);
 
   return `<div class="fade">
-    <div style="display:flex;align-items:center;gap:12px;margin-bottom:22px">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:18px;flex-wrap:wrap">
       <button class="btn-ghost btn-sm" id="back-btn">← Back</button>
       <h1 style="font-family:'Syne',sans-serif;font-weight:800;font-size:22px">${esc(c.title)}</h1>
-      <span class="badge ${c.catClass}">${esc(c.cat)}</span>
     </div>
-    <div style="margin-bottom:12px">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">
-        <span style="font-size:12px;color:var(--muted)">Course progress</span>
-        <span style="font-size:12px;font-weight:600">${pct}%</span>
-      </div>
-      <div class="prog-bg"><div class="prog-fill" style="width:${pct}%;background:var(--accent)"></div></div>
-    </div>
-    <div style="display:grid;grid-template-columns:1fr 230px;gap:18px">
+    <div style="display:grid;grid-template-columns:1fr 260px;gap:20px;align-items:start">
       <div>
-        ${mediaBlock}
+        ${contentHtml}
         <div class="card" style="margin-bottom:12px">
-          <p style="font-family:'Syne',sans-serif;font-weight:700;font-size:17px;margin-bottom:4px">${esc(m.title)}</p>
-          <p style="font-size:13px;color:var(--muted);margin-bottom:14px">${esc(m.description||m.dur)}</p>
-          ${(()=>{
-            const modHasQuiz=m.quiz&&m.quiz.length>0;
-            const modQuizScore=getModuleQuizScore(uid,c.id,m.id,p);
-            const modQuizPassed=modQuizScore!=null&&modQuizScore>=SETTINGS.passThreshold;
-            const moduleComplete=isModuleComplete(uid,c.id,m.id,p);
-            if (!isWatched) {
-              if ((hasVideo && activeTab==='video') || (hasYt && activeTab==='youtube')) {
-                return `<div id="video-status-msg" style="font-size:12px;color:var(--muted)">⏳ Watch the full video to continue${hasPdf?' (or switch tabs and mark complete after reviewing the PDF)':''}</div>`;
-              }
-              return `<button class="btn-primary btn-sm" id="mark-btn" data-cid="${c.id}" data-mid="${m.id}" style="width:auto">Mark as complete</button>`;
-            }
-            if (!modHasQuiz) {
-              return `<span class="badge badge-green" style="font-size:12px;padding:5px 14px">✓ Module complete</span>`;
-            }
-            if (modQuizPassed) {
-              return `<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-                <span class="badge badge-green" style="font-size:12px;padding:5px 14px">✓ Quiz passed: ${modQuizScore}%</span>
-                <button class="btn-ghost btn-sm start-quiz-btn" data-cid="${c.id}" data-mid="${m.id}">Retake module quiz</button>
-              </div>`;
-            }
-            return `<div style="background:#FFF3E0;border:1px solid #FFD9A8;border-radius:var(--r);padding:14px">
-              <p style="font-weight:600;font-size:13px;margin-bottom:4px">📝 Module quiz required</p>
-              <p style="font-size:12px;color:var(--muted);margin-bottom:12px">${modQuizScore!=null?`Last score: ${modQuizScore}% — you need ${SETTINGS.passThreshold}% to unlock the next module.`:`Pass this quiz (${SETTINGS.passThreshold}%) to unlock the next module.`}</p>
-              <button class="btn-primary btn-sm start-quiz-btn" data-cid="${c.id}" data-mid="${m.id}" style="width:auto;background:var(--accent)">
-                ${modQuizScore!=null?'Retake module quiz':'Start module quiz →'}
-              </button>
-            </div>`;
-          })()}
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px">
+            <div>
+              <p style="font-family:'Syne',sans-serif;font-weight:700;font-size:16px;margin-bottom:4px">${esc(m.title)}</p>
+              <p style="font-size:13px;color:var(--muted)">${esc(m.description||'')}</p>
+            </div>
+            <span id="video-status-msg">${isWatched?'<span class="badge badge-green" style="font-size:12px;padding:5px 14px">✓ Watched</span>':''}</span>
+          </div>
+          ${unlocked&&!isWatched&&avail.length>0&&!S._videoUrl&&!m.ytId?`<button class="btn-ghost btn-sm" id="mark-btn" data-cid="${c.id}" data-mid="${m.id}" style="margin-top:12px">✓ Mark as read</button>`:''}
         </div>
-        ${allW?`<div class="card" style="background:#EAFAF4;border-color:#9FE1CB">
-          <p style="font-weight:600;color:var(--success);margin-bottom:6px">🎉 ${sc!=null?'Final quiz taken!':'All modules complete!'}</p>
-          <p style="font-size:13px;color:#085041;margin-bottom:12px">${sc!=null?`Your final quiz score: <strong>${sc}%</strong>. Retake anytime.`:'You\'ve passed every module — take the final quiz to complete the course.'}</p>
-          <button class="btn-primary btn-sm start-quiz-btn" data-cid="${c.id}" style="width:auto;background:var(--success)">
+        ${unlocked&&hasQuiz?`<div class="card">
+          <p style="font-family:'Syne',sans-serif;font-weight:700;font-size:14px;margin-bottom:4px">📝 Module quiz</p>
+          <p style="font-size:13px;color:var(--muted);margin-bottom:14px">Pass with ${SETTINGS.passThreshold}% or more to unlock the next module.</p>
+          ${modScore!=null?`<p style="font-size:13px;margin-bottom:12px">Last score: <strong style="color:${modPassed?'var(--success)':'var(--danger)'}">${modScore}%</strong> ${modPassed?'✓ Passed':'✗ Not passed'}</p>`:''}
+          ${isWatched?`<button class="btn-primary start-quiz-btn" style="width:auto;padding:10px 24px" data-cid="${c.id}" data-mid="${m.id}">
+            ${modScore!=null?'Retake module quiz':'Start module quiz →'}
+          </button>`:`<p style="font-size:13px;color:var(--muted)">Watch the content above to unlock this quiz.</p>`}
+        </div>`:''}
+        ${allModsDone?(sc!=null||coursePassed?`<div class="card" style="background:#EAFAF4;border-color:#9FE1CB">
+          <p style="font-weight:700;font-size:14px;color:var(--success);margin-bottom:6px">${coursePassed?'🎉 Course passed!':'📝 Final quiz result'}</p>
+          <p style="font-size:13px;color:var(--muted);margin-bottom:14px">Score: <strong>${sc}%</strong>${coursePassed?' — Certificate earned!':' — Need '+SETTINGS.passThreshold+'% to pass'}</p>
+          <button class="btn-primary start-quiz-btn" style="width:auto;padding:10px 24px" data-cid="${c.id}" data-mid="">
             ${sc!=null?'Retake final quiz':'Start final quiz →'}
           </button>
-        </div>`:(c.quiz&&c.quiz.length?`<div class="card" style="background:rgba(10,10,15,0.03)">
+        </div>`:(c.quiz&&c.quiz.length?`<div class="card">
+          <p style="font-weight:700;font-size:14px;margin-bottom:6px">🏁 Final course quiz</p>
+          <p style="font-size:13px;color:var(--muted);margin-bottom:14px">All modules complete! Take the final quiz to earn your certificate.</p>
+          <button class="btn-primary start-quiz-btn" style="width:auto;padding:10px 24px" data-cid="${c.id}" data-mid="">Start final quiz →</button>
+        </div>`:'')):(c.quiz&&c.quiz.length?`<div class="card" style="background:rgba(10,10,15,0.03)">
           <p style="font-weight:600;font-size:13px;color:var(--muted)">🔒 Final course quiz locked</p>
           <p style="font-size:12px;color:var(--muted);margin-top:4px">Complete all modules (watch + pass each module quiz) to unlock the final quiz.</p>
         </div>`:'')}
@@ -1064,13 +1017,13 @@ function renderCoursePlayer() {
         <p style="font-family:'Syne',sans-serif;font-weight:700;font-size:13px;margin-bottom:12px">Modules</p>
         ${c.modules.map((mod,i)=>{
           const complete=isModuleComplete(uid,c.id,mod.id,p);
-          const unlocked=isModuleUnlocked(uid,c.id,i,p);
+          const unlck=isModuleUnlocked(uid,c.id,i,p);
           const isActive=S.activeModule?.id===mod.id;
-          const numBg=complete?'var(--success)':unlocked?'rgba(10,10,15,0.06)':'rgba(10,10,15,0.03)';
+          const numBg=complete?'var(--success)':unlck?'rgba(10,10,15,0.06)':'rgba(10,10,15,0.03)';
           const numColor=complete?'#fff':'var(--muted)';
           const modHasQuiz=mod.quiz&&mod.quiz.length>0;
-          return `<div class="mod-item${isActive?' active':''}${unlocked?'':' locked-mod'}" data-mid="${mod.id}" data-unlocked="${unlocked}" style="${unlocked?'':'opacity:0.5;cursor:not-allowed'}">
-            <div class="mod-num" style="background:${numBg};color:${numColor}">${complete?'✓':unlocked?i+1:'🔒'}</div>
+          return `<div class="mod-item${isActive?' active':''}${unlck?'':' locked-mod'}" data-mid="${mod.id}" data-unlocked="${unlck}" style="${unlck?'':'opacity:0.5;cursor:not-allowed'}">
+            <div class="mod-num" style="background:${numBg};color:${numColor}">${complete?'✓':unlck?i+1:'🔒'}</div>
             <div>
               <p style="font-size:13px;font-weight:500">${esc(mod.title)}</p>
               <p style="font-size:11px;color:var(--muted)">${mod.dur}${[mod.ytId?'▶':'',mod.pdf?'📄':''].filter(Boolean).length?' · '+[mod.ytId?'▶':'',mod.pdf?'📄':''].filter(Boolean).join(' '):''}${modHasQuiz?' · 📝':''}</p>
@@ -1153,7 +1106,6 @@ async function saveQuizResult(cid, mid, score, answers) {
   if (mid) p[cid].moduleQuiz[mid] = score;
   else p[cid].quizScore = score;
   S._allProg[uid] = p;
-  // Persist to Supabase
   await DB.saveProgCourse(uid, cid, p[cid]);
   await DB.saveQuizAnswers(uid, quizKey(cid, mid), answers);
   await updateStreak(uid);
@@ -1311,7 +1263,7 @@ function renderLearnerDetail() {
     <div class="tab-bar">
       <button class="tab-btn${S.adminSubTab==='info'?' active':''}" data-subtab="info">Profile & Progress</button>
       <button class="tab-btn${S.adminSubTab==='edit'?' active':''}" data-subtab="edit">Edit Details</button>
-      <button class="tab-btn${S.adminSubTab==='reset'?' active':''}" data-subtab="reset">Change Password</button>
+      <button class="tab-btn${S.adminSubTab==='reset'?' active':''}" data-subtab="reset">Reset Password</button>
     </div>
     ${S.adminSubTab==='info'?renderLearnerInfo(u):S.adminSubTab==='edit'?renderLearnerEdit(u):renderLearnerPwReset(u)}
   </div>`;
@@ -1327,8 +1279,6 @@ function renderLearnerInfo(u) {
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px">
         <p style="font-family:'Syne',sans-serif;font-weight:700;font-size:16px">Per-course breakdown</p>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <button class="btn-ghost btn-sm" id="export-report-btn" data-uid="${u.id}">⬇ Download report</button>
-          <button class="btn-ghost btn-sm" id="export-quiz-btn" data-uid="${u.id}">⬇ Quiz responses CSV</button>
           <button class="btn-danger btn-sm" id="reset-progress-btn" data-uid="${u.id}">Reset progress</button>
           <button class="btn-danger btn-sm" id="toggle-disable-btn" data-uid="${u.id}" data-disabled="${u.disabled}">
             ${u.disabled?'Enable account':'Disable account'}
@@ -1370,13 +1320,13 @@ function renderLearnerEdit(u) {
 }
 
 function renderLearnerPwReset(u) {
-  return `<div class="card" style="max-width:400px">
-    <p style="font-family:'Syne',sans-serif;font-weight:700;font-size:16px;margin-bottom:6px">Change password for ${esc(u.name)}</p>
-    <p style="font-size:13px;color:var(--muted);margin-bottom:18px">Set a temporary password for this learner. They can change it after logging in.</p>
-    <div class="field"><label>New password</label><input type="password" id="new-pw" placeholder="Minimum 6 characters"></div>
-    <div class="field"><label>Confirm new password</label><input type="password" id="new-pw2" placeholder="Repeat password"></div>
+  return `<div class="card" style="max-width:460px">
+    <p style="font-family:'Syne',sans-serif;font-weight:700;font-size:16px;margin-bottom:6px">Reset password for ${esc(u.name)}</p>
+    <p style="font-size:13px;color:var(--muted);margin-bottom:18px">
+      This will send a password reset email to <strong>${esc(u.email)}</strong>. The learner clicks the link in the email to set a new password.
+    </p>
     <div id="pw-msg"></div>
-    <button class="btn-primary" style="width:auto;padding:10px 24px" id="save-pw-btn" data-uid="${u.id}">Update password</button>
+    <button class="btn-primary" style="width:auto;padding:10px 24px" id="send-pw-reset-btn" data-uid="${u.id}" data-email="${esc(u.email)}">Send reset email</button>
   </div>`;
 }
 
@@ -1414,7 +1364,13 @@ function renderReports() {
   const atRisk=stats.filter(u=>u.overall<30).length;
   const avgScore=totalLearners?Math.round(stats.reduce((a,u)=>a+u.overall,0)/totalLearners):0;
   return `<div class="fade">
-    <h1 class="page-title">Reports</h1>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+      <h1 class="page-title">Reports</h1>
+      <div style="display:flex;gap:8px">
+        <button class="btn-ghost btn-sm" id="export-all-progress-btn">⬇ All learners — progress CSV</button>
+        <button class="btn-ghost btn-sm" id="export-all-quiz-btn">⬇ All learners — quiz responses CSV</button>
+      </div>
+    </div>
     <p class="page-sub">Organisation-wide analytics and insights.</p>
     <div class="stat-grid">
       ${[[totalLearners,'Active learners'],[avgScore+'%','Avg completion'],[completed,'Fully completed'],[atRisk,'At risk']]
@@ -1464,7 +1420,6 @@ function renderReports() {
 
 function renderAdminSettings() {
   const stats=getAllStats();
-  const adminPin = sessionStorage.getItem('trv_admin_pin') || localStorage.getItem('trv_admin_pin') || '';
   return `<div class="fade">
     <h1 class="page-title">Settings</h1>
     <p class="page-sub">Configure quiz rules and manage learner quiz attempts.</p>
@@ -1490,18 +1445,6 @@ function renderAdminSettings() {
         <button class="btn-primary" style="width:auto;padding:10px 24px" id="st-save-btn">Save settings</button>
         <button class="btn-ghost btn-sm" id="st-reset-btn">Reset to defaults</button>
       </div>
-    </div>
-    <div class="card" style="max-width:520px;margin-bottom:20px">
-      <p style="font-family:'Syne',sans-serif;font-weight:700;font-size:16px;margin-bottom:4px">Admin Password Reset PIN</p>
-      <p style="font-size:13px;color:var(--muted);margin-bottom:18px">Set a PIN that allows the admin account password to be reset from the login screen if forgotten. Keep this somewhere safe.</p>
-      <div class="field">
-        <label>Admin PIN</label>
-        <div style="display:flex;gap:10px;align-items:center">
-          <input type="password" id="st-admin-pin" placeholder="Set a PIN (any length)" style="max-width:200px" value="${adminPin}">
-          <button class="btn-primary" style="width:auto;padding:9px 20px" id="st-pin-save-btn">Save PIN</button>
-        </div>
-      </div>
-      <div id="st-pin-msg"></div>
     </div>
     <div class="card">
       <p style="font-family:'Syne',sans-serif;font-weight:700;font-size:16px;margin-bottom:4px">Learner Quiz Attempts</p>
@@ -1540,23 +1483,11 @@ function closeModal() {
 function openAddLearnerModal() {
   openModal(`
     <h3>Add Learner</h3>
-    <p class="modal-sub">Create a new learner account manually.</p>
+    <p class="modal-sub">Create a new learner account. They will receive a welcome email from Supabase.</p>
     <div class="field"><label>Full name</label><input type="text" id="ml-name" placeholder="Priya Kapoor"></div>
     <div class="field"><label>Email address</label><input type="email" id="ml-email" placeholder="priya@company.com"></div>
     <div class="field"><label>Subject (optional)</label><input type="text" id="ml-dept" placeholder="e.g. Science"></div>
     <div class="field"><label>Temporary password</label><input type="password" id="ml-pw" placeholder="Min 6 characters"></div>
-    <div class="field">
-      <label>Security question</label>
-      <select id="ml-sq">
-        <option value="">— Choose a question —</option>
-        <option value="pet">What was the name of your first pet?</option>
-        <option value="city">What city were you born in?</option>
-        <option value="mother">What is your mother's maiden name?</option>
-        <option value="school">What was the name of your primary school?</option>
-        <option value="friend">What is the name of your childhood best friend?</option>
-      </select>
-    </div>
-    <div class="field"><label>Security answer</label><input type="text" id="ml-sa" placeholder="Answer (case-insensitive)"></div>
     <div id="ml-msg"></div>
     <div class="modal-actions">
       <button class="btn-ghost" onclick="closeModal()">Cancel</button>
@@ -1717,25 +1648,52 @@ function bindModalEvents() {
     });
   }
 
-  // Save new learner
+  // Save new learner (admin modal — uses SBAUTH.signUp then inserts learners row)
   document.getElementById('ml-save-btn')?.addEventListener('click', async ()=>{
-    const name=document.getElementById('ml-name').value.trim();
-    const email=document.getElementById('ml-email').value.trim().toLowerCase();
-    const dept=document.getElementById('ml-dept').value.trim();
-    const pw=document.getElementById('ml-pw').value;
-    const msg=document.getElementById('ml-msg');
-    if(!name||!email||!pw){msg.innerHTML='<div class="msg-err">All fields required.</div>';return;}
-    if(pw.length<6){msg.innerHTML='<div class="msg-err">Password must be 6+ characters.</div>';return;}
+    const name  = document.getElementById('ml-name').value.trim();
+    const email = document.getElementById('ml-email').value.trim().toLowerCase();
+    const dept  = document.getElementById('ml-dept').value.trim();
+    const pw    = document.getElementById('ml-pw').value;
+    const msg   = document.getElementById('ml-msg');
+
+    if (!name||!email||!pw) { msg.innerHTML='<div class="msg-err">Name, email, and password are required.</div>'; return; }
+    if (pw.length < 6)      { msg.innerHTML='<div class="msg-err">Password must be 6+ characters.</div>'; return; }
+
     try {
-      const users=await DB.learnersWithAuth();
-      if(users.find(u=>u.email===email)){msg.innerHTML='<div class="msg-err">Email already registered.</div>';return;}
-      const sq=document.getElementById('ml-sq')?.value||'';
-      const sa=(document.getElementById('ml-sa')?.value||'').trim().toLowerCase();
-      const nu={id:crypto.randomUUID(),name,email,pw,sq,sa,dept,notes:'',created_at:new Date().toISOString(),disabled:false};
-      await DB.saveLearner(nu);
-      // update cache
+      msg.innerHTML='<div class="msg-ok">Creating account…</div>';
+
+      // 1. Create Supabase Auth user (this doesn't affect the admin's own session)
+      const r = await fetch(`${SUPABASE_URL}/auth/v1/signup`, {
+        method: 'POST',
+        headers: { 'apikey': SUPABASE_ANON, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password: pw, data: { role: 'learner', name } }),
+      });
+      const sbUser = await r.json();
+      if (!r.ok) throw new Error(sbUser.error_description || sbUser.msg || 'Auth sign-up failed.');
+      const authUid = sbUser.user?.id;
+      if (!authUid) throw new Error('No user ID returned from sign-up.');
+
+      // 2. Insert the learners row linked to the new auth user
+      await SB.insert('learners', {
+        id:         crypto.randomUUID(),
+        auth_id:    authUid,
+        name, email,
+        subject:    dept,
+        notes:      '',
+        created_at: new Date().toISOString(),
+        disabled:   false,
+      });
+
+      // 3. Refresh admin stats
       S._allUsers = await DB.learnersWithAuth();
-      closeModal();toast('Learner added successfully');render();
+      await Promise.all((S._allUsers||[]).map(async u => {
+        if (!S._allProg[u.id]) S._allProg[u.id] = await DB.prog(u.id);
+      }));
+      DB._learners = null;
+
+      closeModal();
+      toast('Learner added successfully ✅');
+      render();
     } catch(err) {
       msg.innerHTML=`<div class="msg-err">Error: ${err.message}</div>`;
     }
@@ -1758,10 +1716,9 @@ function bindDropZones() {
   });
 }
 
-// Upload video or PDF to Supabase Storage
 async function handleFileUpload(file, storeKey, dz) {
   if (!file) return;
-  const kind = dz.dataset.kind; // 'video' or 'pdf'
+  const kind = dz.dataset.kind;
   const pEl  = dz.querySelector('p');
 
   if (kind === 'pdf') {
@@ -1779,7 +1736,6 @@ async function handleFileUpload(file, storeKey, dz) {
       pEl.textContent = 'Upload failed — try again';
       toast('Upload failed: ' + err.message, 'err');
     }
-
   } else if (kind === 'video') {
     const isVideo = /^video\//.test(file.type) || /\.(mp4)$/i.test(file.name);
     if (!isVideo) { toast('Please upload an .mp4 file.','err'); return; }
@@ -1899,10 +1855,7 @@ async function saveCourseFromModal() {
     const courseId = existingCid || 'c_'+Date.now();
     const course = {id:courseId, title, cat, catClass, modules, quiz};
     await DB.saveCourse(course);
-
-    // Refresh in-memory list
     COURSES = await DB.courses();
-
     closeModal();
     toast(existingCid?'Course updated ✅':'Course created ✅');
     render();
@@ -1929,100 +1882,153 @@ async function updateStreak(userId) {
 }
 
 // ═══════════════════════════════════════════════════
-// EXPORT HELPERS
+// EXPORT HELPERS — all learners, CSV only
 // ═══════════════════════════════════════════════════
-function exportLearnerReport(uid) {
+
+// CSV 1: Progress report — one row per learner per course
+function exportAllLearnersCSV() {
   const stats = getAllStats();
-  const u = stats.find(x=>x.id===uid);
-  if (!u) return;
-  const now = new Date().toLocaleDateString('en-GB', {day:'2-digit',month:'long',year:'numeric'});
-  const passThresh = SETTINGS.passThreshold;
-  let courseRows = '';
-  COURSES.forEach(c => {
-    const pct = calcCourseProg(u.id, c.id);
-    const wl  = u.p[c.id]?.watched || [];
-    const coursePassed = isCoursePassed(u.id, c.id, u.p);
-    const hasFinal = c.quiz && c.quiz.length>0;
-    const finalSc = hasFinal ? u.p[c.id]?.quizScore : null;
-    const statusColor = coursePassed ? '#1D9E75' : pct>0 ? '#E8A838' : '#E24B4A';
-    const statusText  = coursePassed ? 'Completed' : pct>0 ? 'In progress' : 'Not started';
-    let moduleRows = c.modules.map(mod => {
-      const watchedMod = wl.includes(mod.id);
-      const modHasQuiz = mod.quiz && mod.quiz.length>0;
-      const mScore = u.p[c.id]?.moduleQuiz?.[mod.id] ?? null;
-      const modComplete = isModuleComplete(u.id, c.id, mod.id, u.p);
-      let statusLabel;
-      if (modComplete) statusLabel = '<span style="color:#1D9E75;font-weight:600">✓ Passed</span>';
-      else if (watchedMod && modHasQuiz) statusLabel = `<span style="color:#E8A838;font-weight:600">Watched · quiz ${mScore!=null?mScore+'%':'pending'}</span>`;
-      else if (watchedMod) statusLabel = '<span style="color:#1D9E75;font-weight:600">✓ Watched</span>';
-      else statusLabel = '<span style="color:#aaa;font-weight:600">○ Not started</span>';
-      return `<tr><td style="padding:6px 12px;font-size:12px;color:#444">${esc(mod.title)}</td><td style="padding:6px 12px;font-size:12px;text-align:center">${statusLabel}</td></tr>`;
-    }).join('');
-    courseRows += `<tr style="background:#F5F3EE"><td colspan="2" style="padding:10px 12px">
-      <div style="display:flex;justify-content:space-between;align-items:center">
-        <strong style="font-size:13px">${esc(c.title)}</strong>
-        <div style="display:flex;gap:10px;align-items:center">
-          <span style="font-size:12px;color:#666">${pct}% complete${hasFinal?' · Final quiz: '+(finalSc!=null?finalSc+'%':'pending'):''}</span>
-          <span style="font-size:11px;font-weight:700;padding:3px 10px;border-radius:100px;background:${statusColor}20;color:${statusColor}">${statusText}</span>
-        </div>
-      </div></td></tr>${moduleRows}<tr><td colspan="2" style="padding:4px"></td></tr>`;
+  if (!stats.length) { toast('No learners to export.', 'err'); return; }
+  const now = new Date().toLocaleDateString('en-GB');
+
+  // Build header: Name, Email, Subject, Overall%, then per-course columns
+  const courseHeaders = COURSES.flatMap(c => [
+    `${c.title} — Modules watched`,
+    `${c.title} — Content %`,
+    `${c.title} — Final quiz %`,
+    `${c.title} — Status`,
+  ]);
+  const header = ['Name','Email','Subject','Overall %','Courses passed',...courseHeaders,'Generated'];
+
+  const rows = stats.map(u => {
+    const courseData = COURSES.flatMap(c => {
+      const pct      = calcCourseProg(u.id, c.id);
+      const wl       = u.p[c.id]?.watched || [];
+      const sc       = u.p[c.id]?.quizScore;
+      const passed   = isCoursePassed(u.id, c.id, u.p);
+      const status   = passed ? 'Completed' : pct > 0 ? 'In progress' : 'Not started';
+      return [
+        `${wl.length}/${c.modules.length}`,
+        pct + '%',
+        sc != null ? sc + '%' : 'Not attempted',
+        status,
+      ];
+    });
+    return [
+      u.name,
+      u.email,
+      u.dept || '',
+      u.overall + '%',
+      `${u.passed}/${COURSES.length}`,
+      ...courseData,
+      now,
+    ];
   });
-  const html=`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Learner Report — ${esc(u.name)}</title>
-  <style>body{font-family:'Segoe UI',Arial,sans-serif;margin:0;padding:40px;color:#0A0A0F;background:#fff}.logo{font-size:22px;font-weight:900;color:#0A0A0F}.logo span{color:#FF4D00}h1{font-size:26px;font-weight:800;margin:0 0 4px}.stats{display:flex;gap:16px;margin-bottom:28px}.stat{flex:1;border:1px solid #eee;border-radius:10px;padding:14px 16px}.stat-val{font-size:26px;font-weight:900}.stat-lbl{font-size:11px;color:#888;margin-top:2px}table{width:100%;border-collapse:collapse;font-size:13px}th{text-align:left;padding:9px 12px;font-size:11px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:#888;border-bottom:1px solid #eee}.section-title{font-size:15px;font-weight:800;margin:28px 0 12px}.footer{margin-top:40px;padding-top:16px;border-top:1px solid #eee;font-size:11px;color:#bbb;text-align:center}</style>
-  </head><body>
-  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:32px;padding-bottom:20px;border-bottom:2px solid #FF4D00">
-    <div><div class="logo">Trivekii<span>.</span></div><h1>${esc(u.name)}</h1><div style="font-size:13px;color:#888">${esc(u.email)}${u.dept?' · '+esc(u.dept):''}</div></div>
-    <div style="font-size:12px;color:#888;text-align:right"><div>Learner Progress Report</div><div>Generated: ${now}</div><div>Pass mark: ${passThresh}%</div></div>
-  </div>
-  <div class="stats">
-    <div class="stat"><div class="stat-val">${u.overall}%</div><div class="stat-lbl">Overall completion</div></div>
-    <div class="stat"><div class="stat-val">${u.passed}/${COURSES.length}</div><div class="stat-lbl">Courses passed</div></div>
-    <div class="stat"><div class="stat-val">${u.qDone}/${COURSES.length}</div><div class="stat-lbl">Quizzes attempted</div></div>
-    <div class="stat"><div class="stat-val">${u.avgQ}%</div><div class="stat-lbl">Avg quiz score</div></div>
-  </div>
-  <div class="section-title">Course & Module Breakdown</div>
-  <table><thead><tr><th>Module</th><th style="text-align:center">Status</th></tr></thead><tbody>${courseRows}</tbody></table>
-  <div class="footer">Trivekii LMS · Confidential · ${now}</div>
-  </body></html>`;
-  downloadFile(u.name.replace(/\s+/g,'_')+'_report.html', html, 'text/html');
-  toast('Report downloaded');
+
+  const csv = [header, ...rows]
+    .map(r => r.map(cell => {
+      const s = String(cell == null ? '' : cell).replace(/"/g, '""');
+      return /[,\n"]/.test(s) ? '"' + s + '"' : s;
+    }).join(','))
+    .join('\n');
+
+  const filename = 'trivekii_progress_report_' + new Date().toISOString().slice(0,10) + '.csv';
+  downloadFile(filename, csv, 'text/csv');
+  toast('Progress report downloaded ✅');
 }
 
-async function exportQuizCSV(uid) {
+// CSV 2: Quiz responses — one row per learner per quiz, questions as columns
+async function exportAllQuizCSV() {
   const stats = getAllStats();
-  const u = stats.find(x=>x.id===uid);
-  if (!u) return;
-  const rows=[['Learner','Email','Course','Quiz','Question #','Question','Learner Answer','Correct Answer','Result','Quiz Score %']];
-  async function emitQuiz(c, quizArr, quizLabel, score, qKey) {
-    if(!quizArr||!quizArr.length) return;
-    const storedAnswers = await DB.getQuizAnswers(uid, qKey);
-    quizArr.forEach((q,i)=>{
-      if(score==null){rows.push([u.name,u.email,c.title,quizLabel,i+1,q.q,'Not attempted',q.opts[q.ans],'—','—']);}
-      else if(storedAnswers&&storedAnswers.length){
-        const ansIdx=storedAnswers[i]!=null?storedAnswers[i]:-1;
-        const learnerAns=ansIdx>=0?q.opts[ansIdx]:'No answer recorded';
-        const correct=ansIdx===q.ans;
-        rows.push([u.name,u.email,c.title,quizLabel,i+1,q.q,learnerAns,q.opts[q.ans],correct?'Correct':'Incorrect',score+'%']);
-      } else {
-        rows.push([u.name,u.email,c.title,quizLabel,i+1,q.q,'(detail not available)',q.opts[q.ans],'—',score+'%']);
-      }
-    });
+  if (!stats.length) { toast('No learners to export.', 'err'); return; }
+
+  // ── Step 1: figure out the maximum number of questions across all quizzes
+  // so we can build a fixed-width header
+  let maxQ = 0;
+  for (const c of COURSES) {
+    for (const mod of c.modules) {
+      if (mod.quiz && mod.quiz.length > maxQ) maxQ = mod.quiz.length;
+    }
+    if (c.quiz && c.quiz.length > maxQ) maxQ = c.quiz.length;
   }
-  for(const c of COURSES){
-    for(const mod of c.modules){
-      if(mod.quiz&&mod.quiz.length){
-        const mScore=u.p[c.id]?.moduleQuiz?.[mod.id]??null;
-        await emitQuiz(c,mod.quiz,'Module: '+mod.title,mScore,quizKey(c.id,mod.id));
+
+  // ── Step 2: build header row
+  // Fixed columns: Learner, Email, Subject, Course, Quiz, Score, Passed/Failed
+  // Then for each possible question slot: Q1, Q1 — Learner Answer, Q1 — Correct Answer, Q1 — Result … 
+  const fixedHeaders = ['Learner','Email','Subject','Course','Quiz','Score','Passed/Failed'];
+  const qHeaders = [];
+  for (let i = 1; i <= maxQ; i++) {
+    qHeaders.push(`Q${i}`, `Q${i} — Learner Answer`, `Q${i} — Correct Answer`, `Q${i} — Result`);
+  }
+  const header = [...fixedHeaders, ...qHeaders];
+
+  // ── Step 3: one data row per learner per quiz
+  const dataRows = [];
+
+  for (const u of stats) {
+    async function emitQuizRow(c, quizArr, quizLabel, score, qKey) {
+      if (!quizArr || !quizArr.length) return;
+
+      const storedAnswers = await DB.getQuizAnswers(u.id, qKey);
+      const passedFailed  = score == null ? 'Not attempted'
+                          : score >= SETTINGS.passThreshold ? 'Passed' : 'Failed';
+      const scoreDisplay  = score != null ? score + '%' : 'Not attempted';
+
+      // Fixed columns
+      const row = [u.name, u.email, u.dept||'', c.title, quizLabel, scoreDisplay, passedFailed];
+
+      // Question columns — pad to maxQ so every row is the same width
+      for (let i = 0; i < maxQ; i++) {
+        const q = quizArr[i];
+        if (!q) {
+          // This quiz has fewer questions than maxQ — pad with blanks
+          row.push('', '', '', '');
+          continue;
+        }
+        const questionText   = q.q;
+        const correctAnswer  = q.opts[q.ans];
+
+        if (score == null) {
+          row.push(questionText, 'Not attempted', correctAnswer, '—');
+        } else if (storedAnswers && storedAnswers.length > i) {
+          const ansIdx     = storedAnswers[i] != null ? storedAnswers[i] : -1;
+          const learnerAns = ansIdx >= 0 ? q.opts[ansIdx] : 'No answer recorded';
+          const result     = ansIdx === q.ans ? 'Correct' : 'Incorrect';
+          row.push(questionText, learnerAns, correctAnswer, result);
+        } else {
+          row.push(questionText, '(detail not available)', correctAnswer, '—');
+        }
+      }
+
+      dataRows.push(row);
+    }
+
+    for (const c of COURSES) {
+      for (const mod of c.modules) {
+        if (mod.quiz && mod.quiz.length) {
+          const mScore = u.p[c.id]?.moduleQuiz?.[mod.id] ?? null;
+          await emitQuizRow(c, mod.quiz, 'Module: ' + mod.title, mScore, quizKey(c.id, mod.id));
+        }
+      }
+      if (c.quiz && c.quiz.length) {
+        const fScore = u.p[c.id]?.quizScore ?? null;
+        await emitQuizRow(c, c.quiz, 'Final course quiz', fScore, quizKey(c.id, null));
       }
     }
-    if(c.quiz&&c.quiz.length){
-      const fScore=u.p[c.id]?.quizScore??null;
-      await emitQuiz(c,c.quiz,'Final course quiz',fScore,quizKey(c.id,null));
-    }
   }
-  const csv=rows.map(r=>r.map(cell=>{const s=String(cell==null?'':cell).replace(/"/g,'""');return/[,\n"]/.test(s)?'"'+s+'"':s;}).join(',')).join('\n');
-  downloadFile(u.name.replace(/\s+/g,'_')+'_quiz_responses.csv',csv,'text/csv');
-  toast('Quiz responses CSV downloaded');
+
+  // ── Step 4: serialise to CSV
+  const allRows = [header, ...dataRows];
+  const csv = allRows
+    .map(r => r.map(cell => {
+      const s = String(cell == null ? '' : cell).replace(/"/g, '""');
+      return /[,\n"]/.test(s) ? '"' + s + '"' : s;
+    }).join(','))
+    .join('\n');
+
+  const filename = 'trivekii_quiz_responses_' + new Date().toISOString().slice(0,10) + '.csv';
+  downloadFile(filename, csv, 'text/csv');
+  toast('Quiz responses downloaded ✅');
 }
 
 function downloadFile(filename, content, mimeType) {
@@ -2132,22 +2138,17 @@ function bindEvents() {
     toast('Learner details saved'); render();
   });
 
-  document.getElementById('save-pw-btn')?.addEventListener('click', async e=>{
-    const uid2=e.currentTarget.dataset.uid;
-    const pw=document.getElementById('new-pw').value;
-    const pw2=document.getElementById('new-pw2').value;
-    const msg=document.getElementById('pw-msg');
-    if(pw.length<6){msg.innerHTML='<div class="msg-err">Password must be 6+ characters.</div>';return;}
-    if(pw!==pw2){msg.innerHTML='<div class="msg-err">Passwords do not match.</div>';return;}
-    const users=await DB.learnersWithAuth();
-    const u=users.find(x=>x.id===uid2);
-    if(!u)return;
-    await DB.saveLearner({...u, pw});
-    S._allUsers = await DB.learnersWithAuth();
-    toast('Password updated successfully');
-    document.getElementById('new-pw').value='';
-    document.getElementById('new-pw2').value='';
-    msg.innerHTML='<div class="msg-ok">Password changed.</div>';
+  // Password reset — sends Supabase email to learner
+  document.getElementById('send-pw-reset-btn')?.addEventListener('click', async e=>{
+    const email = e.currentTarget.dataset.email;
+    const msg   = document.getElementById('pw-msg');
+    try {
+      msg.innerHTML='<div class="msg-ok">Sending reset email…</div>';
+      await SBAUTH.sendLearnerPasswordReset(email);
+      msg.innerHTML=`<div class="msg-ok">Reset email sent to <strong>${esc(email)}</strong>. The learner should check their inbox.</div>`;
+    } catch(err) {
+      msg.innerHTML=`<div class="msg-err">Failed to send reset email: ${err.message}</div>`;
+    }
   });
 
   document.getElementById('toggle-disable-btn')?.addEventListener('click', async e=>{
@@ -2161,11 +2162,11 @@ function bindEvents() {
     toast(isDisabled?'Account enabled':'Account disabled'); render();
   });
 
-  document.getElementById('export-report-btn')?.addEventListener('click',e=>{
-    exportLearnerReport(e.currentTarget.dataset.uid);
+  document.getElementById('export-all-progress-btn')?.addEventListener('click', () => {
+    exportAllLearnersCSV();
   });
-  document.getElementById('export-quiz-btn')?.addEventListener('click',e=>{
-    exportQuizCSV(e.currentTarget.dataset.uid);
+  document.getElementById('export-all-quiz-btn')?.addEventListener('click', async () => {
+    await exportAllQuizCSV();
   });
 
   document.getElementById('reset-progress-btn')?.addEventListener('click', async e=>{
@@ -2180,7 +2181,6 @@ function bindEvents() {
     if(!confirm('Permanently delete this learner? This cannot be undone.'))return;
     const uid2=e.currentTarget.dataset.uid;
     await DB.deleteLearner(uid2);
-    await DB.resetProg(uid2);
     await DB.resetRetakes(uid2);
     S._allUsers = S._allUsers?.filter(u=>u.id!==uid2);
     S._allProg[uid2]={};
@@ -2223,15 +2223,6 @@ function bindEvents() {
     await DB.saveSettings(SETTINGS);
     toast('Settings reset to defaults'); render();
   });
-  document.getElementById('st-pin-save-btn')?.addEventListener('click',()=>{
-    const pin=document.getElementById('st-admin-pin')?.value.trim();
-    const pmsg=document.getElementById('st-pin-msg');
-    if(!pin){pmsg.innerHTML='<div class="msg-err">Please enter a PIN.</div>';return;}
-    sessionStorage.setItem('trv_admin_pin',pin);
-    localStorage.setItem('trv_admin_pin',pin);
-    pmsg.innerHTML='<div class="msg-ok">PIN saved.</div>';
-    setTimeout(()=>{if(pmsg)pmsg.innerHTML='';},2000);
-  });
   document.querySelectorAll('.reset-attempts-btn').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
       await DB.resetRetakes(btn.dataset.uid);
@@ -2261,7 +2252,6 @@ function initVideoPlayer() {
   video.addEventListener('timeupdate', () => {
     const vpf = document.getElementById('vpf');
     if (vpf && video.duration > 0) vpf.style.width = (video.currentTime / video.duration * 100) + '%';
-    // Anti-skip: snap back if user jumps more than 3s ahead
     if (video.currentTime > lastTime + 3) {
       video.currentTime = lastTime;
       toast('Please watch the video without skipping', 'err');
@@ -2342,7 +2332,6 @@ function initYouTubePlayer() {
               const bar=document.getElementById('yt-vpf');
               if(bar&&dur>0)bar.style.width=(cur/dur*100)+'%';
               if(isAlreadyWatched||completed||!(dur>0))return;
-              // Anti-skip: snap back if user jumps >4s ahead of furthest watched point
               if(cur>lastTime+4){
                 try{e.target.seekTo(lastTime,true);}catch(_){}
                 toast('Please watch the video without skipping ⛔','err');
@@ -2352,7 +2341,6 @@ function initYouTubePlayer() {
               if(cur>=dur-2){completed=true;clearInterval(tickTimer);markVideoComplete(m.id,cid);}
             },500);
           } else {clearInterval(tickTimer);}
-          // ENDED: only mark complete if they actually watched through (lastTime near end)
           if(e.data===YT.PlayerState.ENDED&&!completed&&!isAlreadyWatched){
             let finalDur=0;try{finalDur=e.target.getDuration();}catch(_){}
             if(finalDur>0&&lastTime>=finalDur-5){
@@ -2404,8 +2392,13 @@ async function markVideoComplete(mid, cid) {
 // BOOT
 // ═══════════════════════════════════════════════════
 (async () => {
-  const existing = DB.session();
-  if (existing) {
-    await boot(existing);
+  if (Auth.load()) {
+    const existing = DB.session();
+    if (existing) {
+      await boot(existing);
+    } else {
+      // Token exists but no app session — force clean login
+      Auth.clear();
+    }
   }
 })();
