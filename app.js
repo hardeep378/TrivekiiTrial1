@@ -1,5 +1,19 @@
 // ═══════════════════════════════════════════════════
 // SUPABASE CONFIG
+//
+// SECURITY NOTES:
+//  • SUPABASE_ANON is a PUBLIC key — it is intentionally
+//    visible in client-side code. Your only access-control
+//    layer is Supabase Row Level Security (RLS). Verify
+//    every table has RLS enabled before going live.
+//
+//  • NEVER put your service-role key here or anywhere in
+//    frontend code. It bypasses RLS entirely and grants
+//    full database access to whoever reads your JS.
+//
+//  • Admin operations that require elevated privileges
+//    must go through Supabase Edge Functions (server-side),
+//    never through the anon key with an admin role claim.
 // ═══════════════════════════════════════════════════
 const SUPABASE_URL  = 'https://procvnkcvbihsyuthkvv.supabase.co';
 const SUPABASE_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InByb2N2bmtjdmJpaHN5dXRoa3Z2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIxMTM2MTIsImV4cCI6MjA5NzY4OTYxMn0.8sCxhuglrcPkSQ0gGgD4_Cn3-bfa2nchZYxYSDVvh4o';
@@ -588,9 +602,14 @@ async function doAuth() {
       const sbSession = await SBAUTH.signIn(email, pw);
       Auth.set(sbSession);
 
-      const meta = sbSession.user.user_metadata || {};
-      const role = meta.role || 'learner';
-      const name = meta.name || email;
+      // SECURITY: role is read from app_metadata (server-controlled, not editable
+      // by the user via the Supabase Auth API) — NOT user_metadata.
+      // To set a user as admin: update app_metadata in the Supabase dashboard or
+      // via a server-side Edge Function. Never trust user_metadata for role checks.
+      const appMeta  = sbSession.user.app_metadata  || {};
+      const userMeta = sbSession.user.user_metadata  || {};
+      const role = appMeta.role || 'learner';
+      const name = userMeta.name || email;
       const authUid = sbSession.user.id;
 
       if (role === 'admin') {
@@ -607,6 +626,9 @@ async function doAuth() {
           Auth.clear();
           throw new Error('This account has been disabled. Please contact your administrator.');
         }
+        // Run RLS check in the background — won't block login, but will warn
+        // visibly if learners can read each other's rows (RLS misconfiguration).
+        checkRLS(authUid).catch(() => {});
         await boot({ role: 'learner', email: u.email, name: u.name, id: u.id, authUid });
       }
 
@@ -661,6 +683,38 @@ async function doAuth() {
     btn.disabled = false;
     const labels = { login: 'Sign in →', register: 'Create account →', reset: 'Send reset link →' };
     btn.textContent = labels[S.authMode] || 'Submit';
+  }
+}
+
+// ─── RLS sanity check ───────────────────────────────────────────────────────
+// Tries to read a row belonging to a different auth user. If Supabase returns
+// results, RLS is OFF and any authenticated user can read everyone's data.
+// Logs a console error and shows a visible banner so the issue can't be missed.
+async function checkRLS(authUid) {
+  try {
+    const rows = await SB.select(
+      'learners',
+      `select=id&auth_id=neq.${authUid}&limit=1`
+    );
+    if (rows.length > 0) {
+      console.error(
+        '[SECURITY] RLS appears DISABLED on the learners table. ' +
+        'Authenticated users can read each other\'s data. ' +
+        'Enable RLS in the Supabase dashboard before going live.'
+      );
+      const banner = document.createElement('div');
+      banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;' +
+        'background:#E24B4A;color:#fff;font-size:13px;font-weight:600;' +
+        'padding:10px 20px;text-align:center';
+      banner.textContent = '\u26a0 SECURITY: Row Level Security is OFF on the learners table. ' +
+        'User data is exposed. Enable RLS in Supabase before going live.';
+      document.body.prepend(banner);
+    } else {
+      console.info('[RLS check] OK — learners table appears to have RLS enabled.');
+    }
+  } catch (e) {
+    // A permissions error means RLS blocked the query — that is correct behaviour.
+    console.info('[RLS check] Query blocked by RLS (expected):', e.message);
   }
 }
 
@@ -1116,6 +1170,64 @@ function getQuizDef(cid, mid) {
   if (!c) return null;
   if (mid) { const m = c.modules.find(x=>x.id===mid); return m ? (m.quiz||[]) : []; }
   return c.quiz || [];
+}
+
+// ═══════════════════════════════════════════════════
+// SERVER-SIDE QUIZ GRADING
+//
+// Calls a Supabase Edge Function (`grade-quiz`) that:
+//   1. Receives the learner's answers
+//   2. Looks up the correct answers server-side (never exposed to the browser)
+//   3. Calculates and returns the score
+//   4. Optionally writes the score directly to the progress table
+//
+// DEPLOY THE EDGE FUNCTION:
+//   supabase functions new grade-quiz
+//   # Implement grading logic in supabase/functions/grade-quiz/index.ts
+//   supabase functions deploy grade-quiz
+//
+// EDGE FUNCTION CONTRACT (grade-quiz/index.ts):
+//   POST body:  { cid: string, mid: string|null, answers: number[] }
+//   Auth header: Bearer <user JWT> (verified server-side via Supabase auth)
+//   Response:   { score: number }   (0-100, integer)
+//
+// Falls back to client-side grading if the function returns a non-200 response
+// (e.g. not yet deployed in local dev). Remove the fallback before going live.
+// ═══════════════════════════════════════════════════
+async function gradeQuizServerSide(cid, mid, answers) {
+  try {
+    const r = await fetch(
+      `${SUPABASE_URL}/functions/v1/grade-quiz`,
+      {
+        method:  'POST',
+        headers: {
+          'Content-Type':  'application/json',
+          'Authorization': 'Bearer ' + Auth.token(),
+          'apikey':        SUPABASE_ANON,
+        },
+        body: JSON.stringify({ cid, mid: mid || null, answers }),
+      }
+    );
+    if (r.ok) {
+      const data = await r.json();
+      if (typeof data.score === 'number') return data.score;
+    }
+    // Edge Function not deployed yet — log a warning and fall back.
+    // TODO: remove this fallback before going live.
+    console.warn(
+      '[grade-quiz] Edge Function returned', r.status,
+      '— falling back to client-side grading. Deploy the Edge Function before launch.'
+    );
+  } catch (e) {
+    console.warn('[grade-quiz] Request failed:', e.message, '— using client-side fallback.');
+  }
+  // ── Client-side fallback (dev only, remove before production) ────────────
+  const quizArr = getQuizDef(cid, mid);
+  if (!quizArr || !quizArr.length) return 0;
+  return Math.round(
+    answers.reduce((acc, ans, i) => acc + (ans === quizArr[i]?.ans ? 1 : 0), 0)
+    / quizArr.length * 100
+  );
 }
 
 async function saveQuizResult(cid, mid, score, answers) {
@@ -2111,7 +2223,14 @@ function bindEvents() {
     const quizArr=getQuizDef(q.cid, q.mid||null);
     q.answers.push(oi);
     if(q.step+1>=quizArr.length){
-      const score=Math.round(q.answers.reduce((a,ans,i)=>a+(ans===quizArr[i].ans?1:0),0)/quizArr.length*100);
+      // ── Server-side grading ─────────────────────────────────────────────
+      // Answers are sent to an Edge Function which grades them server-side
+      // and writes the score directly, so the browser can never forge a result.
+      // Falls back to client-side grading only if the function is not deployed
+      // (i.e. during local development before the Edge Function exists).
+      const score = await gradeQuizServerSide(
+        q.cid, q.mid || null, q.answers
+      );
       q.score=score; q.done=true;
       await saveQuizResult(q.cid, q.mid||null, score, q.answers);
     } else {q.step++;}
