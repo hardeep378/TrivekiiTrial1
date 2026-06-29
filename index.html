@@ -5,12 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' https://www.youtube.com https://s.ytimg.com;
+  script-src 'self' https://www.youtube.com https://s.ytimg.com https://vercel.live;
   style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;
   font-src 'self' https://fonts.gstatic.com;
   img-src 'self' data: https://*.supabase.co https://*.ytimg.com https://i.ytimg.com;
-  connect-src 'self' https://procvnkcvbihsyuthkvv.supabase.co https://www.youtube.com;
-  frame-src https://www.youtube.com https://www.youtube-nocookie.com;
+  media-src 'self' https://procvnkcvbihsyuthkvv.supabase.co;
+  connect-src 'self' https://procvnkcvbihsyuthkvv.supabase.co https://www.youtube.com https://procvnkcvbihsyuthkvv.functions.supabase.co;
+  frame-src https://www.youtube.com https://www.youtube-nocookie.com blob:;
   object-src 'none';
   base-uri 'self';
   form-action 'self';
