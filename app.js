@@ -559,8 +559,8 @@ function setAuthMode(mode) {
   document.getElementById('auth-title').textContent =
     isLogin ? 'Welcome back' : isRegister ? 'Create account' : 'Reset password';
   document.getElementById('auth-subtitle').textContent =
-    isLogin    ? 'Sign in to your Trivekii account' :
-    isRegister ? 'Register as a learner to get started' :
+    isLogin    ? 'Welcome back — ready to continue?' :
+    isRegister ? 'Create your account to get started' :
                  'Enter your email and we\'ll send a reset link';
   document.getElementById('auth-submit-btn').textContent =
     isLogin ? 'Sign in →' : isRegister ? 'Create account →' : 'Send reset link →';
@@ -572,6 +572,7 @@ function setAuthMode(mode) {
   // Show/hide fields
   document.getElementById('field-name').style.display  = isRegister ? '' : 'none';
   document.getElementById('field-pw2').style.display   = isRegister ? '' : 'none';
+  document.getElementById('field-pw-strength').style.display = isRegister ? '' : 'none';
   document.getElementById('field-sq').style.display    = 'none'; // no longer used
   document.getElementById('field-sa').style.display    = 'none'; // no longer used
   document.getElementById('inp-pw').closest('.field').style.display  = isReset ? 'none' : '';
@@ -584,6 +585,37 @@ document.getElementById('auth-toggle').addEventListener('click', () => {
 });
 document.getElementById('forgot-link').addEventListener('click', () => setAuthMode('reset'));
 document.getElementById('auth-submit-btn').addEventListener('click', doAuth);
+
+// ── Password strength meter ──────────────────────────────────────────────────
+(function() {
+  const inp   = document.getElementById('inp-pw');
+  const bar   = document.getElementById('pw-strength-bar');
+  const label = document.getElementById('pw-strength-label');
+  const levels = [
+    { min:0,  pct:15,  color:'#E24B4A', text:'Weak'      },
+    { min:25, pct:40,  color:'#FF8C00', text:'Fair'      },
+    { min:50, pct:70,  color:'#FFB800', text:'Good'      },
+    { min:75, pct:100, color:'#1D9E75', text:'Strong'    },
+  ];
+  function score(pw) {
+    let s = 0;
+    if (pw.length >= 8)  s += 25;
+    if (pw.length >= 12) s += 15;
+    if (/[A-Z]/.test(pw)) s += 20;
+    if (/[0-9]/.test(pw)) s += 20;
+    if (/[^A-Za-z0-9]/.test(pw)) s += 20;
+    return Math.min(s, 100);
+  }
+  inp.addEventListener('input', () => {
+    if (S.authMode !== 'register') return;
+    const s = score(inp.value);
+    const lv = [...levels].reverse().find(l => s >= l.min) || levels[0];
+    bar.style.width   = lv.pct + '%';
+    bar.style.background = lv.color;
+    label.textContent = inp.value ? lv.text : '';
+    label.style.color = lv.color;
+  });
+})();
 document.addEventListener('keydown', e => {
   if (e.key === 'Enter' && authScreen.style.display !== 'none') doAuth();
 });
