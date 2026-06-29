@@ -639,7 +639,7 @@ async function doAuth() {
 
       if (!name)                { showMsg('Please enter your full name.'); return; }
       if (!email.includes('@')) { showMsg('Please enter a valid email address.'); return; }
-      if (pw.length < 6)        { showMsg('Password must be at least 6 characters.'); return; }
+      if (pw.length < 8)        { showMsg('Password must be at least 8 characters.'); return; }
       if (pw !== pw2)           { showMsg('Passwords do not match.'); return; }
 
       // 1. Create the Supabase Auth user
@@ -677,7 +677,7 @@ async function doAuth() {
     }
 
   } catch(err) {
-    showMsg('Error: ' + err.message);
+    showMsg('Error: ' + esc(err.message));
     console.error(err);
   } finally {
     btn.disabled = false;
@@ -1619,7 +1619,7 @@ function openAddLearnerModal() {
     <div class="field"><label>Full name</label><input type="text" id="ml-name" placeholder="Priya Kapoor"></div>
     <div class="field"><label>Email address</label><input type="email" id="ml-email" placeholder="priya@company.com"></div>
     <div class="field"><label>Subject (optional)</label><input type="text" id="ml-dept" placeholder="e.g. Science"></div>
-    <div class="field"><label>Temporary password</label><input type="password" id="ml-pw" placeholder="Min 6 characters"></div>
+    <div class="field"><label>Temporary password</label><input type="password" id="ml-pw" placeholder="Min 8 characters"></div>
     <div id="ml-msg"></div>
     <div class="modal-actions">
       <button class="btn-ghost" onclick="closeModal()">Cancel</button>
@@ -1789,7 +1789,7 @@ function bindModalEvents() {
     const msg   = document.getElementById('ml-msg');
 
     if (!name||!email||!pw) { msg.innerHTML='<div class="msg-err">Name, email, and password are required.</div>'; return; }
-    if (pw.length < 6)      { msg.innerHTML='<div class="msg-err">Password must be 6+ characters.</div>'; return; }
+    if (pw.length < 8)      { msg.innerHTML='<div class="msg-err">Password must be 8+ characters.</div>'; return; }
 
     try {
       msg.innerHTML='<div class="msg-ok">Creating account…</div>';
