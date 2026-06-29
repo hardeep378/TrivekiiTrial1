@@ -23,20 +23,14 @@
 
 <div id="auth-screen">
   <div class="auth-left">
-    <div class="auth-logo">Trivekii<span>.</span></div>
-    <span class="auth-eyebrow">Corporate Learning Platform</span>
-    <h1 class="auth-h1">Train your team.<br><em>Track every step.</em></h1>
-    <p class="auth-sub">A complete learning platform for your organisation — structured courses, gated module quizzes, and live progress analytics, all in one place.</p>
+    <div class="auth-logo">Trivekii<span>.</span> LMS</div>
+    <span class="auth-eyebrow">Your learning journey</span>
+    <h1 class="auth-h1">Keep going.<br><em>You're closer than you think.</em></h1>
+    <p class="auth-sub">Pick up where you left off, work through your modules at your own pace, and earn your certificate when you're done.</p>
     <div class="auth-features">
-      <div class="auth-feature"><div class="auth-feature-icon">🎬</div><div class="auth-feature-text"><strong>Rich learning content</strong><span>Videos, PDFs &amp; external links per module</span></div></div>
-      <div class="auth-feature"><div class="auth-feature-icon">🔒</div><div class="auth-feature-text"><strong>Step-by-step mastery</strong><span>Pass each module quiz to unlock the next</span></div></div>
-      <div class="auth-feature"><div class="auth-feature-icon">📊</div><div class="auth-feature-text"><strong>Admin insight</strong><span>Per-learner reports &amp; exportable results</span></div></div>
-      <div class="auth-feature"><div class="auth-feature-icon">🏆</div><div class="auth-feature-text"><strong>Recognised progress</strong><span>Certificates on course completion</span></div></div>
-    </div>
-    <div class="auth-stats">
-      <div><div class="auth-stat-val">100%</div><div class="auth-stat-lbl">Self-paced</div></div>
-      <div><div class="auth-stat-val">Auto</div><div class="auth-stat-lbl">Graded quizzes</div></div>
-      <div><div class="auth-stat-val">Live</div><div class="auth-stat-lbl">Progress tracking</div></div>
+      <div class="auth-feature"><div class="auth-feature-icon">🎬</div><div class="auth-feature-text"><strong>Everything in one place</strong><span>Video, PDFs and more — no switching tabs</span></div></div>
+      <div class="auth-feature"><div class="auth-feature-icon">🔒</div><div class="auth-feature-text"><strong>Go at your own pace</strong><span>Unlock each module as you progress</span></div></div>
+      <div class="auth-feature"><div class="auth-feature-icon">🏆</div><div class="auth-feature-text"><strong>Earn your certificate</strong><span>Proof of completion waiting at the finish line</span></div></div>
     </div>
   </div>
   <div class="auth-right">
@@ -45,40 +39,35 @@
       <p id="auth-subtitle">Sign in to your Trivekii account</p>
       <div id="auth-msg"></div>
       <div class="field" id="field-name" style="display:none">
-        <label>Full name</label>
-        <input type="text" id="inp-name" placeholder="Rahul Sharma">
+        <label for="inp-name">Full name</label>
+        <input type="text" id="inp-name" placeholder="Rahul Sharma" autocomplete="name">
       </div>
       <div class="field">
-        <label>Email address</label>
-        <input type="email" id="inp-email" placeholder="you@example.com">
+        <label for="inp-email">Email address</label>
+        <input type="email" id="inp-email" placeholder="you@example.com" autocomplete="email">
       </div>
       <div class="field">
-        <label>Password</label>
-        <input type="password" id="inp-pw" placeholder="••••••••">
+        <label for="inp-pw">Password</label>
+        <input type="password" id="inp-pw" placeholder="••••••••" autocomplete="current-password">
+        <p class="auth-switch" id="forgot-row" style="margin-top:6px;text-align:right;margin-bottom:0">
+          <a id="forgot-link" style="font-size:12px;color:var(--muted);cursor:pointer;font-weight:500">Forgot password?</a>
+        </p>
       </div>
       <div class="field" id="field-pw2" style="display:none">
-        <label>Confirm password</label>
-        <input type="password" id="inp-pw2" placeholder="••••••••">
+        <label for="inp-pw2">Confirm password</label>
+        <input type="password" id="inp-pw2" placeholder="••••••••" autocomplete="new-password">
       </div>
-      <div class="field" id="field-sq" style="display:none">
-        <label>Security question</label>
-        <select id="inp-sq">
-          <option value="">— Choose a question —</option>
-          <option value="pet">What was the name of your first pet?</option>
-          <option value="city">What city were you born in?</option>
-          <option value="mother">What is your mother's maiden name?</option>
-          <option value="school">What was the name of your primary school?</option>
-          <option value="friend">What is the name of your childhood best friend?</option>
-        </select>
+      <div id="field-pw-strength" style="display:none;margin-bottom:14px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">
+          <span style="font-size:11px;color:var(--muted)">Password strength</span>
+          <span id="pw-strength-label" style="font-size:11px;font-weight:600"></span>
+        </div>
+        <div class="prog-bg"><div id="pw-strength-bar" class="prog-fill" style="width:0%;background:var(--danger)"></div></div>
       </div>
-      <div class="field" id="field-sa" style="display:none">
-        <label>Security answer <span style="font-size:10px;color:var(--muted)">(case-insensitive)</span></label>
-        <input type="text" id="inp-sa" placeholder="Your answer">
-      </div>
+      <!-- Security question fields retained for legacy compat but hidden -->
+      <div id="field-sq" style="display:none"><select id="inp-sq"></select></div>
+      <div id="field-sa" style="display:none"><input type="text" id="inp-sa"></div>
       <button class="btn-primary" id="auth-submit-btn">Sign in →</button>
-      <p class="auth-switch" id="forgot-row" style="margin-top:10px;text-align:center">
-        <a id="forgot-link" style="font-size:13px;color:var(--accent);cursor:pointer;font-weight:500">Forgot password?</a>
-      </p>
       <p class="auth-switch">
         <span id="auth-switch-text">Don't have an account?</span>
         <a id="auth-toggle"> Register here</a>
@@ -89,7 +78,7 @@
 
 <div id="app-screen">
   <nav class="topnav" id="topnav">
-    <div class="topnav-logo">Trivekii<span>.</span> <span id="nav-role-badge" style="font-size:11px;font-weight:400;color:rgba(245,243,238,0.35);margin-left:4px;display:none">admin</span></div>
+    <div class="topnav-logo">Trivekii<span>.</span> LMS <span id="nav-role-badge" style="font-size:11px;font-weight:400;color:rgba(245,243,238,0.35);margin-left:4px;display:none">admin</span></div>
     <div class="topnav-right">
       <div class="avatar" id="nav-avatar">?</div>
       <span class="topnav-user" id="nav-username"></span>
