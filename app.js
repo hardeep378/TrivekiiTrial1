@@ -1015,7 +1015,7 @@ function renderLearnerDashboard() {
     <div class="card" style="background:var(--ink);border-color:var(--ink)">
       <p style="font-family:'Syne',sans-serif;font-weight:700;font-size:15px;color:#F5F3EE;margin-bottom:6px">Continue learning</p>
       <p style="font-size:13px;color:rgba(245,243,238,0.5);margin-bottom:14px">Pick up where you left off.</p>
-      <button class="btn-primary" style="width:auto;padding:10px 24px" onclick="S.tab='courses';buildSidebar();render()">Go to my courses →</button>
+      <button class="btn-primary" style="width:auto;padding:10px 24px" id="go-to-courses-btn">Go to my courses →</button>
     </div>
   </div>`;
 }
@@ -1654,7 +1654,7 @@ function openAddLearnerModal() {
     <div class="field"><label>Temporary password</label><input type="password" id="ml-pw" placeholder="Min 8 characters"></div>
     <div id="ml-msg"></div>
     <div class="modal-actions">
-      <button class="btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn-ghost" id="ml-cancel-btn">Cancel</button>
       <button class="btn-primary" style="width:auto;padding:10px 24px" id="ml-save-btn">Create account</button>
     </div>`);
 }
@@ -1686,7 +1686,7 @@ function openAddCourseModal(existingCourse) {
     <button class="btn-ghost btn-sm" id="add-q-btn" style="margin-bottom:20px">+ Add question</button>
     <div id="mc-msg"></div>
     <div class="modal-actions">
-      <button class="btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn-ghost" id="mc-cancel-btn">Cancel</button>
       <button class="btn-primary" style="width:auto;padding:10px 24px" id="mc-save-btn" data-cid="${esc(c?.id||'')}">
         ${isEdit?'Save changes':'Create course'}
       </button>
@@ -1813,6 +1813,8 @@ function bindModalEvents() {
   }
 
   // Save new learner (admin modal — uses SBAUTH.signUp then inserts learners row)
+  document.getElementById('ml-cancel-btn')?.addEventListener('click', closeModal);
+  document.getElementById('mc-cancel-btn')?.addEventListener('click', closeModal);
   document.getElementById('ml-save-btn')?.addEventListener('click', async ()=>{
     const name  = document.getElementById('ml-name').value.trim();
     const email = document.getElementById('ml-email').value.trim().toLowerCase();
@@ -2207,6 +2209,7 @@ function downloadFile(filename, content, mimeType) {
 // EVENT BINDING
 // ═══════════════════════════════════════════════════
 function bindEvents() {
+  document.getElementById('go-to-courses-btn')?.addEventListener('click',()=>{S.tab='courses';buildSidebar();render();});
   document.getElementById('back-btn')?.addEventListener('click',()=>{S.activeCourse=null;S.activeModule=null;render();});
 
   document.querySelectorAll('.mod-item[data-mid]').forEach(el=>el.addEventListener('click',()=>{
